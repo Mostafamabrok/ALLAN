@@ -87,6 +87,7 @@ def test_run():
 
     #print(x.messages)
 
-test_run()
+if __name__ == "main":
+    test_run()
 
 
