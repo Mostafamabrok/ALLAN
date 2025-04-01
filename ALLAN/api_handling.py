@@ -42,9 +42,13 @@ class Conversation:
             self.send(user_input)
             print(self.model + ": " + self.latest_response)
 
-    def voice_chat(self):
+    def voice_message(self):
         import speech_recognition as sr
+        import pyttsx3
+
         recognizer = sr.Recognizer()
+        engine = pyttsx3.init()
+        
         with sr.Microphone() as source:
             print("SPEAK: ")
             recognizer.adjust_for_ambient_noise(source)
@@ -55,6 +59,8 @@ class Conversation:
             print("You said: ", text)
             self.send(text)
             print(self.model + ": " + self.latest_response)
+            engine.say(self.latest_response)
+            engine.runAndWait()
             return text
         
         except sr.UnknownValueError:
@@ -62,13 +68,18 @@ class Conversation:
         except sr.RequestError:
             print("Could not request results, internet connection.")
 
+    def voice_chat(self):
+        while True:
+            self.voice_message()
+    
+
 
 
     
     
     
 def test_run():
-    x = Conversation(True, "deepseek-r1:7b")
+    x = Conversation(True, "gemma3:12b")
     #x.send("What is your name?")
     #print(x.latest_response)
 
