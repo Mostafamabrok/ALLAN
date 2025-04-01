@@ -12,6 +12,7 @@ class Conversation:
                                 <open_chrome>, <open_edge>, <press_key[key]>, <restart_conversation.>
                                 I have an automated tool set up that reads what you says and executes functions that you say like the ones above, but you must say them in that exact way.
                                 I CAN NOT call these functions. YOU call the functions by saying them (ie. "Of course I can open Chrome! <open_chrome>"). YOU are my assistant."""
+
         self.history = history # History is for loading previous conversations.
         if self.history == "":
             self.messages = [{"role": "system", "content": self.system_prompt}] #Stores conversation history as a list of dictionaries.
@@ -41,6 +42,28 @@ class Conversation:
             self.send(user_input)
             print(self.model + ": " + self.latest_response)
 
+    def voice_chat(self):
+        import speech_recognition as sr
+        recognizer = sr.Recognizer()
+        with sr.Microphone() as source:
+            print("SPEAK: ")
+            recognizer.adjust_for_ambient_noise(source)
+            audio = recognizer.listen(source)
+
+        try:
+            text = recognizer.recognize_google(audio)
+            print("You said: ", text)
+            self.send(text)
+            print(self.model + ": " + self.latest_response)
+            return text
+        
+        except sr.UnknownValueError:
+            print("Audio Incomprehensible")
+        except sr.RequestError:
+            print("Could not request results, internet connection.")
+
+
+
     
     
     
@@ -49,9 +72,9 @@ def test_run():
     #x.send("What is your name?")
     #print(x.latest_response)
 
-    x.terminal_chat()
+    x.voice_chat()
 
-    print(x.messages)
+    #print(x.messages)
 
 test_run()
 
