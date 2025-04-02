@@ -14,6 +14,8 @@ class Conversation:
                                 I CAN NOT call these functions. YOU call the functions by saying them (ie. "Of course I can open Chrome! <open_chrome>"). YOU are my assistant."""
 
         self.history = history # History is for loading previous conversations.
+        self.called_functions = []
+
         if self.history == "":
             self.messages = [{"role": "system", "content": self.system_prompt}] #Stores conversation history as a list of dictionaries.
         else: 
@@ -37,10 +39,14 @@ class Conversation:
     def terminal_chat(self):
         while True:
             user_input = input("You: ")
-            if user_input.lower == "exit":
+
+            if user_input.lower() == "exit":
+                input("Press enter to close window. ")
                 break
+
             self.send(user_input)
             print(self.model + ": " + self.latest_response)
+    
 
     def voice_message(self):
         import speech_recognition as sr
