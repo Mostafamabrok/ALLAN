@@ -2,5 +2,4 @@ ollama
 openai
 speechrecognition
 pyttsx3
-pyaudio
 gtts3
