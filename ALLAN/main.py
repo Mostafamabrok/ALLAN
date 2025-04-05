@@ -8,6 +8,27 @@ config = { #This should be editable by the user without going into the code late
     'permanence': True
 }
 
+def init_check():
+    
+    def create_missing_folder(folder):
+        if os.path.isdir(folder):
+            pass
+
+        if not os.path.isdir(folder):
+            print("Creating new " + str(folder) + " directory.")
+            os.mkdir(folder)
+
+    create_missing_folder("conversations")
+    create_missing_folder("functions")
+
+    if not os.path.isfile("allan_core.py"):
+        print(os.listdir())
+        print("ALLAN CORE PROGRAM IS MISSING, PLEASE REINSTALL.")
+        input("Press Enter to Exit: ")
+        exit()
+
+    print("Initial Check Successful. \n")
+
 
 def allan_terminal_ui():
 
@@ -38,4 +59,8 @@ def allan_terminal_ui():
     #I have no idea.
     #This works for now though.
 
+
+
+
+init_check()
 allan_terminal_ui()
