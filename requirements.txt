@@ -1,5 +1,3 @@
 ollama
 openai
-speechrecognition
-pyttsx3
-gtts3
+
