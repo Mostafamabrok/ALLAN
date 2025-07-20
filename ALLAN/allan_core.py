@@ -1,15 +1,17 @@
+# main.py
 import time
 import json
 import asyncio
 import re
 
-# We now import the specific function from our new api file.
+# ALLAN Modules
 from llm_api import call_model
+from network import NetworkManager
 
 DEFAULT_ALLAN_CONFIG = {
     "name": "UnnamedAgent",
     "role": "Worker",
-    "model": "llama3",
+    "model": "gemma3",
     "system_prompt": """You are an autonomous AI agent. You process incoming messages and decide on a course of action.
 You have an internal knowledge base. If a task is a question you can answer, you should answer it directly using the `send_message` tool.
 
@@ -18,6 +20,7 @@ Your available tools are:
 - send_message(recipient: str, message: str)
 - work_complete() -> Call this with no arguments when you have fully completed the task prompted by the message.
 
+IMPORTANT: Always follow the [CALL: function_name(arg1="value1")] structure, even for functions with no arguments. 
 IMPORTANT: If you lack the tools and the knowledge to complete a task, you must report this limitation back to the sender. Do not invent tools that are not on this list.
 IMPORTANT: You must never use `send_message` with `recipient="System"`.
 """,
@@ -26,27 +29,6 @@ IMPORTANT: You must never use `send_message` with `recipient="System"`.
     "superiors": [],
     "subordinates": []
 }
-
-class NetworkManager:
-    def __init__(self):
-        self.agents = {}
-
-    def log(self, message: str):
-        print(f"[Network LOG]: {message}")
-
-    def register(self, agent):
-        self.agents[agent.name] = agent
-        self.log(f"Registered agent: {agent.name}")
-
-    async def send_message(self, recipient_name, message_content, sender_name):
-        recipient = self.agents.get(recipient_name)
-        if recipient:
-            message = {"sender": sender_name, "content": message_content}
-            await recipient.inbox.put(message)
-            self.log(f"Routed message from {sender_name} to {recipient_name}")
-        else:
-            self.log(f"ERROR: Agent '{recipient_name}' not found.")
-
 
 class Allan:
     def __init__(self, config: dict, manager: NetworkManager):
@@ -57,7 +39,6 @@ class Allan:
         self.name = self.config['name']
         self.network_manager = manager
         self.inbox = asyncio.Queue()
-        # Message history is back. This gives the agent memory.
         self.message_history = []
         
     def log(self, message: str):
@@ -106,17 +87,14 @@ class Allan:
             
             prompt = f"You have received a message from '{sender}'. The message is: '{content}'. Based on your role, tools, and our conversation history, what action(s) will you take?"
             
-            # Add the current prompt to the agent's history
             self.message_history.append({"role": "user", "content": prompt})
 
-            # The context now includes the full conversation history
             context = [
                 {"role": "system", "content": self.config['system_prompt']}
             ] + self.message_history
             
             response_plan = call_model(self.config['model'], context)
             
-            # Add the agent's own response to its history so it remembers what it said
             self.message_history.append({"role": "assistant", "content": response_plan})
 
             self.log(f"Generated plan: {response_plan}")
