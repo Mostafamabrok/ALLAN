@@ -3,11 +3,8 @@ import json
 import asyncio
 import re
 
-try:
-    import ollama
-except ImportError:
-    print("Warning: The 'ollama' library is not installed.")
-    ollama = None
+# We now import the specific function from our new api file.
+from llm_api import call_model
 
 DEFAULT_ALLAN_CONFIG = {
     "name": "UnnamedAgent",
@@ -58,28 +55,13 @@ class Allan:
         
         self.config = final_config
         self.name = self.config['name']
-        self.message_history = []
         self.network_manager = manager
         self.inbox = asyncio.Queue()
+        # Message history is back. This gives the agent memory.
+        self.message_history = []
         
     def log(self, message: str):
         print(f"[{self.name} LOG]: {message}")
-
-    def call_model(self, prompt: str) -> str:
-        if not ollama:
-            return "Ollama library not installed."
-
-        context = [
-            {"role": "system", "content": self.config['system_prompt']},
-            {"role": "user", "content": prompt}
-        ]
-
-        try:
-            response = ollama.chat(model=self.config['model'], messages=context)
-            return response['message']['content']
-        except Exception as e:
-            self.log(f"ERROR calling Ollama: {e}")
-            return f"Error calling Ollama: {e}"
 
     def parse_for_calls(self, text: str) -> list:
         call_pattern = r'\[CALL:\s*(\w+)\((.*?)\)\s*\]'
@@ -122,9 +104,21 @@ class Allan:
             sender = incoming_message['sender']
             content = incoming_message['content']
             
-            prompt = f"You have received a message from '{sender}'. The message is: '{content}'. Based on your role and tools, what action(s) will you take?"
+            prompt = f"You have received a message from '{sender}'. The message is: '{content}'. Based on your role, tools, and our conversation history, what action(s) will you take?"
             
-            response_plan = self.call_model(prompt)
+            # Add the current prompt to the agent's history
+            self.message_history.append({"role": "user", "content": prompt})
+
+            # The context now includes the full conversation history
+            context = [
+                {"role": "system", "content": self.config['system_prompt']}
+            ] + self.message_history
+            
+            response_plan = call_model(self.config['model'], context)
+            
+            # Add the agent's own response to its history so it remembers what it said
+            self.message_history.append({"role": "assistant", "content": response_plan})
+
             self.log(f"Generated plan: {response_plan}")
 
             tool_calls = self.parse_for_calls(response_plan)
