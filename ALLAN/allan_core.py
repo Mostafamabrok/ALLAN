@@ -1,109 +1,175 @@
-#This file will contain the functions for doing requests with the API.
-#This removes excess clutter from other files and keeps things easy to work on in the future.
+import time
+import json
+import asyncio
+import re
 
-class Conversation:
-    def __init__(self, permanence, model, api_type="ollama", history = ""): #Permanance is a boolean.
-        self.api_type = api_type
-        self.permanence = permanence
-        self.model = model
-        self.system_prompt = """Your name is ALLAN and you are a helpful assistant.
-                                You have a variety of functions at your disposal.
-                                Here are your functions. You can call them by simply saying them like this: <[function_name]>.
-                                <open_chrome>, <open_edge>, <press_key[key]>, <restart_conversation.>
-                                I have an automated tool set up that reads what you says and executes functions that you say like the ones above, but you must say them in that exact way.
-                                I CAN NOT call these functions. YOU call the functions by saying them (ie. "Of course I can open Chrome! <open_chrome>"). YOU are my assistant."""
+try:
+    import ollama
+except ImportError:
+    print("Warning: The 'ollama' library is not installed.")
+    ollama = None
 
-        self.history = history # History is for loading previous conversations.
-        self.called_functions = []
+DEFAULT_ALLAN_CONFIG = {
+    "name": "UnnamedAgent",
+    "role": "Worker",
+    "model": "llama3",
+    "system_prompt": """You are an autonomous AI agent. You process incoming messages and decide on a course of action.
+You have an internal knowledge base. If a task is a question you can answer, you should answer it directly using the `send_message` tool.
 
-        if self.history == "":
-            self.messages = [{"role": "system", "content": self.system_prompt}] #Stores conversation history as a list of dictionaries.
-        else: 
-            self.messages = self.history
+To act, you must use tools. Respond with one or more tool calls in the format: [CALL: function_name(arg1="value1")]
+Your available tools are:
+- send_message(recipient: str, message: str)
+- work_complete() -> Call this with no arguments when you have fully completed the task prompted by the message.
 
-    def send(self, message):
+IMPORTANT: If you lack the tools and the knowledge to complete a task, you must report this limitation back to the sender. Do not invent tools that are not on this list.
+IMPORTANT: You must never use `send_message` with `recipient="System"`.
+""",
+    "job_description": "No job description provided.",
+    "permissions": [],
+    "superiors": [],
+    "subordinates": []
+}
 
-        import re
+class NetworkManager:
+    def __init__(self):
+        self.agents = {}
 
-        self.messages.append({"role": "user", "content": message})
+    def log(self, message: str):
+        print(f"[Network LOG]: {message}")
 
-        if self.api_type == "ollama":
-            import ollama
-            api_response = ollama.chat(model= self.model, messages=self.messages)
-            self.latest_response = api_response['message']['content']
+    def register(self, agent):
+        self.agents[agent.name] = agent
+        self.log(f"Registered agent: {agent.name}")
 
-        if self.api_type == "openai":
-            import openai
-            api_response = openai.ChatCompletion.create(model = self.model, messages=self.messages)
-            self.latest_response = api_response["choices"][0]["message"]
+    async def send_message(self, recipient_name, message_content, sender_name):
+        recipient = self.agents.get(recipient_name)
+        if recipient:
+            message = {"sender": sender_name, "content": message_content}
+            await recipient.inbox.put(message)
+            self.log(f"Routed message from {sender_name} to {recipient_name}")
+        else:
+            self.log(f"ERROR: Agent '{recipient_name}' not found.")
+
+
+class Allan:
+    def __init__(self, config: dict, manager: NetworkManager):
+        final_config = DEFAULT_ALLAN_CONFIG.copy()
+        final_config.update(config)
         
-        self.messages.append({"role": "assistant", "content": self.latest_response})
+        self.config = final_config
+        self.name = self.config['name']
+        self.message_history = []
+        self.network_manager = manager
+        self.inbox = asyncio.Queue()
         
-        self.called_functions = []
+    def log(self, message: str):
+        print(f"[{self.name} LOG]: {message}")
 
-        response_funcs = re.findall(r"<[^<>]+>", self.latest_response)
-        for func in response_funcs:
-            self.called_functions.append(func)
+    def call_model(self, prompt: str) -> str:
+        if not ollama:
+            return "Ollama library not installed."
 
-    def terminal_chat(self):
-        while True:
-            user_input = input("You: ")
-
-            if user_input.lower() == "exit":
-                input("Press enter to close window. ")
-                break
-
-            self.send(user_input)
-            print(self.model + ": " + self.latest_response)
-            #DEBUG CODE: print("CALLED FUNCITIONS: " + str(self.called_functions))
-    
-
-    def voice_message(self):
-        import speech_recognition as sr
-        import pyttsx3
-
-        recognizer = sr.Recognizer()
-        engine = pyttsx3.init()
-        
-        with sr.Microphone() as source:
-            print("SPEAK: ")
-            recognizer.adjust_for_ambient_noise(source)
-            audio = recognizer.listen(source)
+        context = [
+            {"role": "system", "content": self.config['system_prompt']},
+            {"role": "user", "content": prompt}
+        ]
 
         try:
-            text = recognizer.recognize_google(audio)
-            print("You said: ", text)
-            self.send(text)
-            print(self.model + ": " + self.latest_response)
-            engine.say(self.latest_response)
-            engine.runAndWait()
-            return text
+            response = ollama.chat(model=self.config['model'], messages=context)
+            return response['message']['content']
+        except Exception as e:
+            self.log(f"ERROR calling Ollama: {e}")
+            return f"Error calling Ollama: {e}"
+
+    def parse_for_calls(self, text: str) -> list:
+        call_pattern = r'\[CALL:\s*(\w+)\((.*?)\)\s*\]'
+        matches = re.findall(call_pattern, text)
+        calls = []
+        for func_name, args_str in matches:
+            args_pattern = r'(\w+)\s*=\s*"(.*?)"'
+            args_matches = re.findall(args_pattern, args_str)
+            args_dict = {key: value for key, value in args_matches}
+            calls.append({"function": func_name, "args": args_dict})
+        return calls
+
+    async def execute_tool(self, tool_call: dict):
+        function_name = tool_call.get("function")
+        args = tool_call.get("args", {})
         
-        except sr.UnknownValueError:
-            print("Audio Incomprehensible")
-        except sr.RequestError:
-            print("Could not request results, internet connection.")
+        if function_name == "send_message":
+            recipient = args.get("recipient")
+            message = args.get("message")
+            if recipient and message:
+                await self.network_manager.send_message(
+                    recipient_name=recipient,
+                    message_content=message,
+                    sender_name=self.name
+                )
+            else:
+                self.log("ERROR: send_message tool called with missing arguments.")
+        
+        elif function_name == "work_complete":
+            self.log("Task processing is complete. Awaiting next message.")
 
-    def voice_chat(self):
+        else:
+            self.log(f"ERROR: Attempted to call unknown tool '{function_name}'.")
+
+    async def run(self):
+        self.log("Event loop started. Awaiting messages.")
         while True:
-            self.voice_message()
+            incoming_message = await self.inbox.get()
+            
+            sender = incoming_message['sender']
+            content = incoming_message['content']
+            
+            prompt = f"You have received a message from '{sender}'. The message is: '{content}'. Based on your role and tools, what action(s) will you take?"
+            
+            response_plan = self.call_model(prompt)
+            self.log(f"Generated plan: {response_plan}")
+
+            tool_calls = self.parse_for_calls(response_plan)
+            if tool_calls:
+                self.log(f"Executing actions: {tool_calls}")
+                for call in tool_calls:
+                    await self.execute_tool(call)
+            else:
+                self.log("No tool calls found in plan.")
+            
+            self.inbox.task_done()
+
+
+async def main():
+    print("--- Initializing Agent Network ---")
+    network = NetworkManager()
+
+    master_config = {"name": "MasterBot", "role": "Manager", "job_description": "Delegate tasks to workers."}
+    worker_config = {"name": "WorkerBot", "role": "Worker", "job_description": "Execute tasks from my manager."}
     
+    master = Allan(master_config, network)
+    worker = Allan(worker_config, network)
+
+    network.register(master)
+    network.register(worker)
+
+    asyncio.create_task(master.run())
+    asyncio.create_task(worker.run())
+
+    print("\n--- Kicking off conversation ---")
+    await asyncio.sleep(1)
+
+    initial_prompt = "We need to know what the capital of Egypt is. Please delegate this task to WorkerBot."
+    await network.send_message(
+        recipient_name="MasterBot",
+        message_content=initial_prompt,
+        sender_name="System"
+    )
+
+    await asyncio.sleep(30)
+    print("\n--- Test finished ---")
 
 
-
-    
-    
-    
-def test_run():
-    x = Conversation(True, "gemma3:12b")
-    #x.send("What is your name?")
-    #print(x.latest_response)
-
-    x.voice_chat()
-
-    #print(x.messages)
-
-if __name__ == "main":
-    test_run()
-
-
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n--- Shutting down network ---")
