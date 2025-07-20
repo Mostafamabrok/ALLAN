@@ -5,6 +5,7 @@ import asyncio
 import re
 
 # ALLAN Modules
+from utils import log
 from llm_api import call_model
 from network import NetworkManager
 
@@ -40,9 +41,6 @@ class Allan:
         self.network_manager = manager
         self.inbox = asyncio.Queue()
         self.message_history = []
-        
-    def log(self, message: str):
-        print(f"[{self.name} LOG]: {message}")
 
     def parse_for_calls(self, text: str) -> list:
         call_pattern = r'\[CALL:\s*(\w+)\((.*?)\)\s*\]'
@@ -69,16 +67,16 @@ class Allan:
                     sender_name=self.name
                 )
             else:
-                self.log("ERROR: send_message tool called with missing arguments.")
+                log("ERROR: send_message tool called with missing arguments.", source=self.name)
         
         elif function_name == "work_complete":
-            self.log("Task processing is complete. Awaiting next message.")
+            log("Task processing is complete. Awaiting next message.", source=self.name)
 
         else:
-            self.log(f"ERROR: Attempted to call unknown tool '{function_name}'.")
+            log(f"ERROR: Attempted to call unknown tool '{function_name}'.", source=self.name)
 
     async def run(self):
-        self.log("Event loop started. Awaiting messages.")
+        log("Event loop started. Awaiting messages.", source=self.name)
         while True:
             incoming_message = await self.inbox.get()
             
@@ -97,15 +95,15 @@ class Allan:
             
             self.message_history.append({"role": "assistant", "content": response_plan})
 
-            self.log(f"Generated plan: {response_plan}")
+            log(f"Generated plan: {response_plan}", source=self.name)
 
             tool_calls = self.parse_for_calls(response_plan)
             if tool_calls:
-                self.log(f"Executing actions: {tool_calls}")
+                log(f"Executing actions: {tool_calls}", source=self.name)
                 for call in tool_calls:
                     await self.execute_tool(call)
             else:
-                self.log("No tool calls found in plan.")
+                log("No tool calls found in plan.", source=self.name)
             
             self.inbox.task_done()
 
