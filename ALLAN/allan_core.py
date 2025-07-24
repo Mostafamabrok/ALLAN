@@ -1,4 +1,3 @@
-# main.py
 import time
 import json
 import asyncio
@@ -8,6 +7,7 @@ import re
 from utils import log
 from llm_api import call_model
 from network import NetworkManager
+import tools 
 
 DEFAULT_ALLAN_CONFIG = {
     "name": "UnnamedAgent",
@@ -28,7 +28,8 @@ IMPORTANT: You must never use `send_message` with `recipient="System"`.
     "job_description": "No job description provided.",
     "permissions": [],
     "superiors": [],
-    "subordinates": []
+    "subordinates": [],
+    "toolbox": {} # The toolbox is now part of the default config
 }
 
 class Allan:
@@ -41,6 +42,7 @@ class Allan:
         self.network_manager = manager
         self.inbox = asyncio.Queue()
         self.message_history = []
+        self.toolbox = self.config['toolbox'] # Toolbox is now pulled from the config
 
     def parse_for_calls(self, text: str) -> list:
         call_pattern = r'\[CALL:\s*(\w+)\((.*?)\)\s*\]'
@@ -54,24 +56,14 @@ class Allan:
         return calls
 
     async def execute_tool(self, tool_call: dict):
+        """Looks up a tool in the agent's toolbox and executes it."""
         function_name = tool_call.get("function")
         args = tool_call.get("args", {})
         
-        if function_name == "send_message":
-            recipient = args.get("recipient")
-            message = args.get("message")
-            if recipient and message:
-                await self.network_manager.send_message(
-                    recipient_name=recipient,
-                    message_content=message,
-                    sender_name=self.name
-                )
-            else:
-                log("ERROR: send_message tool called with missing arguments.", source=self.name)
+        tool_function = self.toolbox.get(function_name)
         
-        elif function_name == "work_complete":
-            log("Task processing is complete. Awaiting next message.", source=self.name)
-
+        if tool_function:
+            await tool_function(self, **args)
         else:
             log(f"ERROR: Attempted to call unknown tool '{function_name}'.", source=self.name)
 
@@ -112,9 +104,27 @@ async def main():
     print("--- Initializing Agent Network ---")
     network = NetworkManager()
 
-    master_config = {"name": "MasterBot", "role": "Manager", "job_description": "Delegate tasks to workers."}
-    worker_config = {"name": "WorkerBot", "role": "Worker", "job_description": "Execute tasks from my manager."}
+    # The toolbox is now defined within each agent's specific config
+    master_config = {
+        "name": "MasterBot", 
+        "role": "Manager", 
+        "job_description": "Delegate tasks to workers.",
+        "toolbox": {
+            "send_message": tools.send_message,
+            "work_complete": tools.work_complete
+        }
+    }
+    worker_config = {
+        "name": "WorkerBot", 
+        "role": "Worker", 
+        "job_description": "Execute tasks from my manager.",
+        "toolbox": {
+            "send_message": tools.send_message,
+            "work_complete": tools.work_complete
+        }
+    }
     
+    # The constructor is now simpler
     master = Allan(master_config, network)
     worker = Allan(worker_config, network)
 

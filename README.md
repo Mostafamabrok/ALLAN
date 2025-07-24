@@ -1,2 +1,2 @@
 # ALLAN
-ALLAN is an AI-powered voice assistant (that will be) capable of helping the user do everyday tasks on their computer, as well as interacting with real-world machinery.
+ALLAN, which stands for "Autonomous Language Learning (Model) Agent Network", is a system that facilitates the auto-coordination of agents. Can (or will) be used for human-level work such as developing or testing software, or writing reports by interacting with real-world sensors. Anything you can imagine.
