@@ -10,6 +10,69 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 HISTORY_FILE = os.path.join(STORAGE_DIR, "allan_prime_history.json")
 
+INTERFACE_RULES = {
+    "terminal": {
+        "label": "terminal",
+        "forbidden": [
+            "markdown headings",
+            "markdown tables",
+            "code fences",
+            "emoji",
+            "long multi-line blocks",
+            "xml-like formatting in user output",
+        ],
+        "required": [
+            "plain text only",
+            "short paragraphs",
+            "no markdown",
+            "no tool tags in user-facing output",
+        ],
+    },
+    "voice": {
+        "label": "voice",
+        "forbidden": [
+            "markdown",
+            "bullet lists",
+            "tool tags",
+            "very long sentences",
+            "excessive punctuation",
+        ],
+        "required": [
+            "spoken-language style",
+            "brief and natural responses",
+            "clear direct answer",
+            "no hidden system formatting",
+        ],
+    },
+    "default": {
+        "label": "unknown",
+        "forbidden": [
+            "raw tool tags",
+            "internal reasoning leaks",
+            "markdown if the interface is plain text",
+        ],
+        "required": [
+            "be interface-aware",
+            "follow the current interface constraints",
+        ],
+    },
+}
+
+
+def get_interface_prompt(interface_name="terminal"):
+    interface_type = INTERFACE_RULES.get(interface_name.lower(), INTERFACE_RULES["default"])
+    forbidden = ", ".join(interface_type["forbidden"])
+    required = ", ".join(interface_type["required"])
+    return f"""CURRENT INTERFACE: {interface_type['label']}
+You are running on a {interface_type['label']} interface.
+Formatting rules for this interface:
+- Forbidden: {forbidden}
+- Required: {required}
+Never output forbidden formatting to the user on this interface.
+If a tool result needs to be summarized, do it in the correct format for this interface without exposing internal specs or tool tags.
+"""
+
+
 SYSTEM_PROMPT = """You are ALLAN (Autonomous Language Learning Agent Network), an advanced, highly capable AI assistant.
 You maintain two conversation threads:
 - internal_chat: private reasoning, tool decisions, and system state. This is never shown to the user.
@@ -22,6 +85,7 @@ RULES:
 4. Do not expose hidden reasoning to the user.
 5. If no tool is needed, still provide the answer in <user_reply> ... </user_reply>.
 6. After a web_search or web_dive result, summarize what you found in the final user reply instead of saying you are still processing.
+7. Always respect the current interface constraints described in the interface instructions.
 
 TOOL FORMAT:
 <tool>{"name": "the_tool_name", "args": {"argument_key": "argument_value"}}</tool>
@@ -132,20 +196,20 @@ def _extract_user_reply(raw_response):
     return None
 
 
-def _follow_up_after_tool(user_input, tool_result, history_context):
+def _follow_up_after_tool(user_input, tool_result, history_context, interface_name="terminal"):
     prompt = (
         "The tool finished running and gathered fresh information. "
         "Now produce a concise user-facing answer summarizing what it found. "
         "Do not mention hidden reasoning, tool internals, or that you are still processing. "
-        "Respond in <user_reply>...</user_reply> only.\n\n"
+        "Respect the current interface constraints and respond in <user_reply>...</user_reply> only.\n\n"
         f"User request: {user_input}\n\n"
         f"Tool result:\n{tool_result}"
     )
     thinking, response = call_model(
-        prompt=f"{history_context}\nALLAN_INTERNAL:\n{prompt}",
+        prompt=f"{history_context}\n{get_interface_prompt(interface_name)}\nALLAN_INTERNAL:\n{prompt}",
         model_name="claude-sonnet-5",
         max_tokens=1024,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=SYSTEM_PROMPT + "\n" + get_interface_prompt(interface_name),
     )
 
     if response is None:
@@ -168,17 +232,17 @@ def _follow_up_after_tool(user_input, tool_result, history_context):
     return "I found the relevant information and summarized it above."
 
 
-def ALLAN_prime(user_input):
+def ALLAN_prime(user_input, interface_name="terminal"):
     append_to_user_chat(f"User: {user_input}")
 
     history = get_history()
-    prompt_context = f"{_format_history_for_prompt(history)}\nALLAN_INTERNAL:"
+    prompt_context = f"{_format_history_for_prompt(history)}\n{get_interface_prompt(interface_name)}\nALLAN_INTERNAL:"
 
     thinking, response = call_model(
         prompt=prompt_context,
         model_name="claude-sonnet-5",
         max_tokens=1024,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=SYSTEM_PROMPT + "\n" + get_interface_prompt(interface_name),
     )
 
     if response is None:
@@ -209,7 +273,12 @@ def ALLAN_prime(user_input):
         final_user_reply = "I’m processing that internally before answering."
 
     if final_user_reply == "I’m processing that internally before answering." and tool_result is not None:
-        follow_up_reply = _follow_up_after_tool(user_input, tool_result, _format_history_for_prompt(get_history()))
+        follow_up_reply = _follow_up_after_tool(
+            user_input,
+            tool_result,
+            _format_history_for_prompt(get_history()),
+            interface_name=interface_name,
+        )
         if follow_up_reply:
             final_user_reply = follow_up_reply
 

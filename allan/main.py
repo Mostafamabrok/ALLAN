@@ -24,8 +24,8 @@ def terminal_interface():
         if not user_input.strip():
             continue
         
-        # Route the input to the main engine
-        response = ALLAN_prime(user_input)
+        # Route the input to the main engine with the active interface context.
+        response = ALLAN_prime(user_input, interface_name="terminal")
         
         # Output the generated response to the user space
         print(f"ALLAN: {response}")
