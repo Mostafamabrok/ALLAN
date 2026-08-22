@@ -1,6 +1,1 @@
-# ALLAN v2 dependencies.
-# The 'echo' backend needs none of these — you can run the skeleton on a bare
-# Python install. Install these when you want AP's real brains:
-
-anthropic      # Claude API — AP's main brain
-ollama         # local models served on your PC (free, private background work)
+#redo
