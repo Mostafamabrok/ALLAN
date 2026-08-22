@@ -1,9 +1,11 @@
 import os
+import re
 from llm_api import call_model
 from parser import parse_and_route
 
 # Define storage paths globally
-STORAGE_DIR = "storage"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 HISTORY_FILE = os.path.join(STORAGE_DIR, "allan_prime_history.txt")
 
 
@@ -30,46 +32,54 @@ def init_storage():
         with open(HISTORY_FILE, "w") as f:
             pass
 
+
 def get_history():
     with open(HISTORY_FILE, "r") as f:
         return f.read().strip()
+
 
 def append_to_history(text):
     with open(HISTORY_FILE, "a") as f:
         f.write(text + "\n")
 
+
 def clear_history():
     with open(HISTORY_FILE, "w") as f:
         pass
 
-def ALLAN_prime(user_input):
 
+def ALLAN_prime(user_input):
     append_to_history(f"User: {user_input}")
-    
+
     full_history = get_history()
     prompt_context = f"{full_history}\nALLAN:"
-    
+
     # Pass the SYSTEM_PROMPT into the LLM call
     thinking, response = call_model(
-        prompt=prompt_context, 
-        model_name="claude-sonnet-5", 
+        prompt=prompt_context,
+        model_name="claude-sonnet-5",
         max_tokens=1024,
-        system_prompt=SYSTEM_PROMPT
+        system_prompt=SYSTEM_PROMPT,
     )
-    
+
     if response is None:
         return "System Error: The LLM API failed to return a response."
-    
+
     if thinking:
         append_to_history(f"[ALLAN INTERNAL THOUGHT]: {thinking}")
-            
+
     append_to_history(f"ALLAN: {response}")
 
     # Tool routing
-    tool_result = parse_and_route(response, agent_id="ALLAN_Prime")
-    
-    if tool_result:
-        append_to_history(f"[SYSTEM TOOL EXECUTION]: {tool_result}")
-        response += f"\n\n[System Execution]: {tool_result}"
+    tool_match = re.search(r'<tool>(.*?)</tool>', response, re.DOTALL)
+    if tool_match:
+        tool_result = parse_and_route(response, agent_id="ALLAN_Prime")
+        if tool_result:
+            cleaned_response = response[:tool_match.start()] + response[tool_match.end():]
+            cleaned_response = re.sub(r"\s+", " ", cleaned_response).strip()
+            append_to_history(f"[SYSTEM TOOL EXECUTION]: {tool_result}")
+            if cleaned_response:
+                return f"{cleaned_response}\n\n[Tool Output]: {tool_result}"
+            return f"[Tool Output]: {tool_result}"
 
     return response
