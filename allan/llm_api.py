@@ -1,4 +1,4 @@
-def call_model(prompt, model_name="claude-sonnet-5", effort_level=None, max_tokens=1000):
+def call_model(prompt, model_name="claude-sonnet-5", effort_level=None, max_tokens=1000, system_prompt=""):
 
     ## FOR NOW THIS WILL ONLEY WORK WITH ANTHROPIC MODELS, BUT WE CAN ADD MORE LATER
 
@@ -31,6 +31,7 @@ def call_model(prompt, model_name="claude-sonnet-5", effort_level=None, max_toke
         response = client.messages.create(
             model=model_name,
             max_tokens=max_tokens,
+            system = system_prompt,
             messages=[
                 {
                     "role": "user",
