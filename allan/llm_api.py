@@ -4,6 +4,7 @@ def call_model(prompt, model_name="claude-sonnet-5", effort_level=None, max_toke
 
     ## Model_name/effort level thing is pretty bad, because we want to just call an effort level and be done with it.
     ## There should be a mapping of effort level to model name, but for now we will just use the model name directly.
+    ## model_name should also decide provider, same time and delay.
 
     try:
         import anthropic
