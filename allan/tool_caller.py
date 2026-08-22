@@ -6,7 +6,7 @@ from contextlib import redirect_stdout, redirect_stderr
 # Mock permissions table: Define which agents can run which tools
 AGENT_PERMISSIONS = {
     "ALLAN_Prime": ["*"],  # Prime has root access
-    "sub_agent_researcher": ["web_search", "read_file"],
+    "sub_agent_researcher": ["web_search", "web_dive", "read_file"],
 }
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))

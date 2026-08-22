@@ -21,12 +21,14 @@ RULES:
 3. When you are ready to speak to the user, wrap the final visible response in <user_reply> ... </user_reply>.
 4. Do not expose hidden reasoning to the user.
 5. If no tool is needed, still provide the answer in <user_reply> ... </user_reply>.
+6. After a web_search or web_dive result, summarize what you found in the final user reply instead of saying you are still processing.
 
 TOOL FORMAT:
 <tool>{"name": "the_tool_name", "args": {"argument_key": "argument_value"}}</tool>
 
 Available Tools:
 - web_search: Performs a web search. EXAMPLE: <tool>{"name": "web_search", "args": {"query": "capital of France"}}</tool>.
+- web_dive: Fetches and extracts readable text from a specific page URL. EXAMPLE: <tool>{"name": "web_dive", "args": {"url": "https://example.com/topic", "max_chars": 2500}}</tool>.
 
 Only the final user reply should be visible to the user."""
 
@@ -130,6 +132,42 @@ def _extract_user_reply(raw_response):
     return None
 
 
+def _follow_up_after_tool(user_input, tool_result, history_context):
+    prompt = (
+        "The tool finished running and gathered fresh information. "
+        "Now produce a concise user-facing answer summarizing what it found. "
+        "Do not mention hidden reasoning, tool internals, or that you are still processing. "
+        "Respond in <user_reply>...</user_reply> only.\n\n"
+        f"User request: {user_input}\n\n"
+        f"Tool result:\n{tool_result}"
+    )
+    thinking, response = call_model(
+        prompt=f"{history_context}\nALLAN_INTERNAL:\n{prompt}",
+        model_name="claude-sonnet-5",
+        max_tokens=1024,
+        system_prompt=SYSTEM_PROMPT,
+    )
+
+    if response is None:
+        return None
+
+    if thinking:
+        append_to_internal_chat(f"[ALLAN INTERNAL THOUGHT]: {thinking}")
+
+    append_to_internal_chat(f"ALLAN_INTERNAL: {response}")
+
+    user_reply = _extract_user_reply(response)
+    if user_reply:
+        return user_reply
+
+    cleaned_response = re.sub(r'<tool>(.*?)</tool>', '', response, flags=re.DOTALL)
+    cleaned_response = re.sub(r'\s+', ' ', cleaned_response).strip()
+    if cleaned_response:
+        return cleaned_response
+
+    return "I found the relevant information and summarized it above."
+
+
 def ALLAN_prime(user_input):
     append_to_user_chat(f"User: {user_input}")
 
@@ -151,7 +189,7 @@ def ALLAN_prime(user_input):
 
     append_to_internal_chat(f"ALLAN_INTERNAL: {response}")
 
-    # Tool routing happens in the internal thread before the final user answer is chosen.
+    tool_result = None
     tool_match = re.search(r'<tool>(.*?)</tool>', response, re.DOTALL)
     if tool_match:
         tool_result = parse_and_route(response, agent_id="ALLAN_Prime")
@@ -169,6 +207,11 @@ def ALLAN_prime(user_input):
 
     if not final_user_reply:
         final_user_reply = "I’m processing that internally before answering."
+
+    if final_user_reply == "I’m processing that internally before answering." and tool_result is not None:
+        follow_up_reply = _follow_up_after_tool(user_input, tool_result, _format_history_for_prompt(get_history()))
+        if follow_up_reply:
+            final_user_reply = follow_up_reply
 
     append_to_user_chat(f"ALLAN: {final_user_reply}")
     return final_user_reply
