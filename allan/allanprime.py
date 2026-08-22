@@ -9,8 +9,6 @@ from parser import parse_and_route
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 HISTORY_FILE = os.path.join(STORAGE_DIR, "allan_prime_history.json")
-INTERNAL_CHAT_FILE = os.path.join(STORAGE_DIR, "internal_chat.txt")
-USER_CHAT_FILE = os.path.join(STORAGE_DIR, "user_chat.txt")
 
 SYSTEM_PROMPT = """You are ALLAN (Autonomous Language Learning Agent Network), an advanced, highly capable AI assistant.
 You maintain two conversation threads:
@@ -35,18 +33,6 @@ Only the final user reply should be visible to the user."""
 
 def _empty_history():
     return {"entries": []}
-
-
-def _read_thread(file_path):
-    if not os.path.exists(file_path):
-        return ""
-    with open(file_path, "r", encoding="utf-8") as f:
-        return f.read().strip()
-
-
-def _append_to_thread(file_path, text):
-    with open(file_path, "a", encoding="utf-8") as f:
-        f.write(text + "\n")
 
 
 def _write_history(history):
@@ -91,14 +77,21 @@ def _format_history_for_prompt(history):
     return "\n".join(formatted)
 
 
+def _remove_legacy_thread_files():
+    legacy_files = [
+        os.path.join(STORAGE_DIR, "internal_chat.txt"),
+        os.path.join(STORAGE_DIR, "user_chat.txt"),
+    ]
+    for file_path in legacy_files:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+
 def init_storage():
     if not os.path.exists(STORAGE_DIR):
         os.makedirs(STORAGE_DIR)
 
-    for file_path in (HISTORY_FILE, INTERNAL_CHAT_FILE, USER_CHAT_FILE):
-        if not os.path.exists(file_path):
-            with open(file_path, "w", encoding="utf-8") as f:
-                pass
+    _remove_legacy_thread_files()
 
     if not os.path.exists(HISTORY_FILE) or os.path.getsize(HISTORY_FILE) == 0:
         _write_history(_empty_history())
@@ -118,21 +111,16 @@ def append_to_history(text, thread="system"):
 
 
 def append_to_internal_chat(text):
-    _append_to_thread(INTERNAL_CHAT_FILE, text)
     append_to_history(text, thread="internal")
 
 
 def append_to_user_chat(text):
-    _append_to_thread(USER_CHAT_FILE, text)
     append_to_history(text, thread="user")
 
 
 def clear_history():
     _write_history(_empty_history())
-
-    for file_path in (INTERNAL_CHAT_FILE, USER_CHAT_FILE):
-        with open(file_path, "w", encoding="utf-8") as f:
-            pass
+    _remove_legacy_thread_files()
 
 
 def _extract_user_reply(raw_response):
