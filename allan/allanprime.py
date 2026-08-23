@@ -257,6 +257,16 @@ def _extract_user_reply(raw_response):
     return None
 
 
+def _route_result_has_failure(route_result):
+    if route_result is None:
+        return False
+    text = str(route_result)
+    if re.search(r"\[(?:PARSER|MEMORY|TOOL) ERROR\]", text, flags=re.IGNORECASE):
+        return True
+    lower = text.lower()
+    return '"error"' in lower or '"deleted": false' in lower or '"reason": "not_found"' in lower
+
+
 def _follow_up_after_tool(user_input, tool_result, history_context, interface_name="terminal"):
     prompt = (
         "The tool finished running and gathered fresh information. "
@@ -350,8 +360,8 @@ def ALLAN_prime(user_input, interface_name="terminal"):
             append_to_internal_chat(f"[SYSTEM TOOL EXECUTION]: {route_result}")
             response = cleaned_response
 
-    if route_result is not None and re.search(r"\[(?:PARSER|MEMORY|TOOL) ERROR\]", str(route_result), flags=re.IGNORECASE):
-        final_user_reply = "The previous tool or memory call failed because the payload was invalid JSON. No action was executed."
+    if _route_result_has_failure(route_result):
+        final_user_reply = "The previous tool or memory call failed, so no action was executed."
         append_to_internal_chat(f"[SYSTEM TOOL EXECUTION FAILURE]: {route_result}")
         append_to_user_chat(f"ALLAN: {final_user_reply}")
         return final_user_reply
@@ -366,8 +376,8 @@ def ALLAN_prime(user_input, interface_name="terminal"):
         final_user_reply = "I’m processing that internally before answering."
 
     if final_user_reply == "I’m processing that internally before answering." and route_result is not None:
-        if re.search(r"\[(?:PARSER|MEMORY|TOOL) ERROR\]", str(route_result), flags=re.IGNORECASE):
-            final_user_reply = "The previous tool or memory call failed because the payload was invalid JSON. No action was executed."
+        if _route_result_has_failure(route_result):
+            final_user_reply = "The previous tool or memory call failed, so no action was executed."
         else:
             follow_up_reply = _follow_up_after_tool(
                 user_input,

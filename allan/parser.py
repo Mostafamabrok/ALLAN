@@ -9,14 +9,24 @@ def _route_memory_or_tool(request_obj, agent_id):
     if not isinstance(request_obj, dict):
         return "[PARSER ERROR]: Memory/tool payload was not valid JSON object."
 
-    # Backwards-compatibility: some older outputs wrapped memory calls as <tool>{"name":"memory", ...}
+    # Memory is a separate opcode. Never route it through the normal tool system.
     if request_obj.get("name") == "memory":
-        nested = request_obj.get("args")
-        if isinstance(nested, dict):
-            return call_memory(nested, agent_id)
-        return call_memory(request_obj, agent_id)
+        return (
+            "[MEMORY ERROR]: Invalid memory call format. "
+            "Memory operations must use <memory>...</memory> and never be wrapped in <tool>."
+        )
 
-    if "action" in request_obj or "name" in request_obj or "type" in request_obj:
+    # Detect likely memory-op payloads and route them to memory handling.
+    if "action" in request_obj or request_obj.get("name") in {
+        "search",
+        "retrieve",
+        "read",
+        "write",
+        "rewrite",
+        "update",
+        "delete",
+        "find",
+    } or "type" in request_obj:
         return call_memory(request_obj, agent_id)
 
     return call_tool(request_obj, agent_id)

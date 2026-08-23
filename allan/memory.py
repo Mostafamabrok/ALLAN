@@ -386,12 +386,14 @@ def call_memory(request, agent_id="ALLAN_Prime"):
     if not isinstance(request, dict):
         return "[MEMORY ERROR]: Memory request must be a JSON object."
 
+    # Legacy/wrong format: memory wrapped in a tool tag is invalid.
+    # Reject it explicitly so the caller knows the memory call failed instead of pretending success.
+    if request.get("name") == "memory":
+        return "[MEMORY ERROR]: Invalid memory call format. Memory operations must use <memory>...</memory> and never be wrapped in <tool>."
+
     # Accept both shapes:
     #   {"action": "search", "args": { ... }}
     #   {"action": "search", "query": "..."}
-    if request.get("name") == "memory" and isinstance(request.get("args"), dict):
-        request = request["args"]
-
     action = request.get("action") or request.get("name") or request.get("type")
     payload = request.get("args") if isinstance(request.get("args"), dict) else request
     if action is None:
