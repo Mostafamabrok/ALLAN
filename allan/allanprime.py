@@ -263,6 +263,31 @@ def _follow_up_after_tool(user_input, tool_result, history_context, interface_na
 
 
 def ALLAN_prime(user_input, interface_name="terminal"):
+    # Temporary feature: Full clear wipe all memory when the user requests it explicitly.
+    if isinstance(user_input, str) and user_input.strip().lower() == "full clear":
+        # remove raw context and memory dirs
+        try:
+            if os.path.exists(RAW_CONTEXT_DIR):
+                for fname in os.listdir(RAW_CONTEXT_DIR):
+                    try:
+                        os.remove(os.path.join(RAW_CONTEXT_DIR, fname))
+                    except Exception:
+                        pass
+            if os.path.exists(MEMORY_DIR):
+                for fname in os.listdir(MEMORY_DIR):
+                    try:
+                        os.remove(os.path.join(MEMORY_DIR, fname))
+                    except Exception:
+                        pass
+            # rewrite empty history and summary files
+            _write_history(_empty_history())
+            with open(GENERAL_SUMMARY_FILE, "w", encoding="utf-8") as f:
+                json.dump({"summaries": []}, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+        except Exception:
+            pass
+        return "All memory cleared. (raw histories and summaries wiped)"
+
     append_to_user_chat(f"User: {user_input}")
 
     history = get_history()

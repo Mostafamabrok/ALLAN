@@ -135,8 +135,10 @@ def compress_events():
         # Build a prompt for the model summarization
         prompt_parts = [
             "You are given a sequence of raw agent history entries. Produce a compact list of concise summary items.\n",
-            "Requirements:\n- For each summary item, provide: 'summary' (one or two sentences), 'references' (list of raw entry ids from the input), and 'agent' (the agent filename).\n",
-            "- Return the result as a JSON array of objects. Do NOT include the raw entry texts in the output.\n\n",
+            "Event qualification: Create a new summary item only when an entry (or small group of consecutive entries) describes a distinct action or change in state: e.g., a tool invocation, an external data fetch result, a decision, a plan step, or a user question that requires work. Do NOT create separate events for simple user echoes, confirmations, or repeated user_reply mirrors.\n",
+            "Requirements:\n- For each summary item, provide: 'summary' (one or two sentences), 'compact' (a single extremely short phrase <= 12 words), 'references' (list of raw entry ids from the input), and 'agent' (the agent filename).\n",
+            "- The 'compact' field should be highly compressed (focus keywords or 6-12 words) to save tokens for later retrieval.\n",
+            "- Return the result as a JSON array of objects with these fields. IMPORTANT: Return ONLY valid JSON (a JSON array). Do NOT include the raw entry texts in the output. If you cannot produce valid JSON, return an empty JSON array '[]'.\n\n",
             "Input entries:\n",
         ]
         for e in new_entries:
@@ -192,10 +194,41 @@ def compress_events():
             normalized.append(item)
         parsed = normalized
 
-        # If parsing failed or yielded no references, treat whole response as a single summary
+        # If parsing failed or yielded no references, attempt a strict JSON-only retry using the raw entries.
         if not parsed or all(not it.get("references") for it in parsed):
             combined_refs = [{"agent": agent_name, "id": int(e.get('id'))} for e in new_entries]
-            parsed = [{"summary": raw_response.strip(), "references": combined_refs, "agent": agent_name}]
+            # strict retry: ask the model to return only valid JSON array, otherwise return []
+            strict_prompt = (
+                "Return ONLY a JSON array of summary objects following the earlier requirements.\nDo not include raw texts.\nInput entries:\n" + "\n".join([f"ID:{e.get('id')} TS:{e.get('timestamp')} TEXT:{e.get('text','')}" for e in new_entries])
+            )
+            try:
+                thinking_retry, response_retry = call_model(
+                    prompt=strict_prompt,
+                    model_name=MODEL_NAME,
+                    max_tokens=MAX_TOKENS,
+                    system_prompt=SETTINGS.get("system_prompt", ""),
+                )
+                jstart_r = response_retry.find("[")
+                jend_r = response_retry.rfind("]")
+                if jstart_r != -1 and jend_r != -1 and jend_r > jstart_r:
+                    try:
+                        parsed = json.loads(response_retry[jstart_r:jend_r+1])
+                        # normalize references below as usual
+                    except Exception:
+                        parsed = []
+                else:
+                    parsed = []
+            except Exception:
+                parsed = []
+
+            # if still nothing parseable, create a compact heuristic summary (do NOT dump full raw texts)
+            if not parsed:
+                # Create a short merge summary: count + brief tags from entry starts
+                count = len(new_entries)
+                starts = [ (e.get('text','')[:80].replace('\n',' ') ) for e in new_entries ]
+                summary_text = f"{count} events: " + " ; ".join(starts[:3])
+                compact_text = ", ".join([s.split()[:6] and " ".join(s.split()[:6]) for s in starts[:3]])
+                parsed = [{"summary": summary_text, "compact": compact_text, "references": combined_refs, "agent": agent_name}]
 
         # Append parsed summaries to general summary file, assign incremental ids
         next_sum_id = 1
@@ -207,15 +240,140 @@ def compress_events():
 
         for item in parsed:
             item_id = next_sum_id
+            summary_text = item.get("summary") or item.get("text") or ""
+            compact_text = item.get("compact")
+
+            # If the model returned a tool tag, placeholder, or an extremely short/empty summary,
+            # try to resolve the referenced raw entries and ask the LLM to produce a proper compact summary.
+            need_resolution = False
+            try:
+                if not summary_text.strip():
+                    need_resolution = True
+                elif "<tool>" in summary_text.lower():
+                    need_resolution = True
+                elif len(summary_text.strip()) < 30:
+                    need_resolution = True
+            except Exception:
+                need_resolution = True
+
+            if need_resolution:
+                refs = item.get("references", [])
+                collected_texts = []
+                for r in refs:
+                    try:
+                        agent_file = os.path.join(RAW_CONTEXT_DIR, r.get("agent"))
+                        data = _load_json(agent_file, {"entries": []})
+                        for e in data.get("entries", []):
+                            try:
+                                if int(e.get("id", 0)) == int(r.get("id", 0)):
+                                    collected_texts.append(e.get("text", ""))
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                combined = "\n\n".join(collected_texts).strip()
+                if combined:
+                    # Ask the model to compress the combined raw texts into a short summary + compact phrase
+                    comp_prompt = (
+                        "Compress the following raw agent texts into a single JSON object with fields: '")
+                    comp_prompt += ("summary' (1-2 sentences) and 'compact' (a single highly compressed phrase, 6-12 words).\\n\\nRaw texts:\n" + combined)
+                    try:
+                        thinking2, response2 = call_model(
+                            prompt=comp_prompt,
+                            model_name=MODEL_NAME,
+                            max_tokens=min(400, MAX_TOKENS),
+                            system_prompt=SETTINGS.get("system_prompt", ""),
+                        )
+                        # Extract JSON object from response
+                        jstart = response2.find("{")
+                        jend = response2.rfind("}")
+                        if jstart != -1 and jend != -1 and jend > jstart:
+                            try:
+                                parsed2 = json.loads(response2[jstart:jend+1])
+                                summary_text = parsed2.get("summary", summary_text)
+                                compact_text = parsed2.get("compact", compact_text)
+                            except Exception:
+                                # fallback heuristics
+                                summary_text = " ".join(combined.split()[:60])
+                                compact_text = " ".join(combined.split()[:10])
+                        else:
+                            summary_text = " ".join(combined.split()[:60])
+                            compact_text = " ".join(combined.split()[:10])
+                    except Exception:
+                        summary_text = " ".join(combined.split()[:60])
+                        compact_text = " ".join(combined.split()[:10])
+
+            # fallback compact: take first 10 words if still missing
+            if not compact_text or not str(compact_text).strip():
+                compact_text = " ".join(summary_text.split()[:10]).strip()
+
             item_entry = {
                 "id": item_id,
                 "agent": agent_name,
-                "summary": item.get("summary") or item.get("text") or "",
+                "summary": summary_text,
+                "compact_summary": compact_text,
                 "references": item.get("references", []),
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
             summaries.append(item_entry)
             next_sum_id += 1
+
+    # Post-process existing summaries: for any summary that looks like a tool-tag placeholder or is too short,
+    # attempt to regenerate a compact summary by resolving its references and compressing the raw texts.
+    def _regenerate_from_refs(entry):
+        try:
+            stext = entry.get("summary","") or ""
+            if stext and "<tool>" not in stext.lower() and len(stext.strip()) >= 30:
+                return entry
+            refs = entry.get("references", [])
+            collected = []
+            for r in refs:
+                try:
+                    af = os.path.join(RAW_CONTEXT_DIR, r.get("agent"))
+                    data = _load_json(af, {"entries": []})
+                    for e in data.get("entries", []):
+                        try:
+                            if int(e.get("id", 0)) == int(r.get("id", 0)):
+                                collected.append(e.get("text", ""))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            combined = "\n\n".join(collected).strip()
+            if not combined:
+                return entry
+            comp_prompt = (
+                "Compress the following raw agent texts into a single JSON object with fields: 'summary' (1-2 sentences) and 'compact' (a single highly compressed phrase, 6-12 words).\\n\\nRaw texts:\n" + combined)
+            thinking3, response3 = call_model(
+                prompt=comp_prompt,
+                model_name=MODEL_NAME,
+                max_tokens=min(400, MAX_TOKENS),
+                system_prompt=SETTINGS.get("system_prompt", ""),
+            )
+            jstart = response3.find("{")
+            jend = response3.rfind("}")
+            if jstart != -1 and jend != -1 and jend > jstart:
+                try:
+                    parsed3 = json.loads(response3[jstart:jend+1])
+                    entry["summary"] = parsed3.get("summary", entry.get("summary",""))
+                    entry["compact_summary"] = parsed3.get("compact", entry.get("compact_summary",""))
+                except Exception:
+                    entry["summary"] = " ".join(combined.split()[:60])
+                    entry["compact_summary"] = " ".join(combined.split()[:10])
+            else:
+                entry["summary"] = " ".join(combined.split()[:60])
+                entry["compact_summary"] = " ".join(combined.split()[:10])
+            return entry
+        except Exception:
+            return entry
+
+    for idx, s in enumerate(summaries):
+        try:
+            stext = s.get("summary","") or ""
+            if (not stext.strip()) or ("<tool>" in stext.lower()) or len(stext.strip()) < 30:
+                summaries[idx] = _regenerate_from_refs(s)
+        except Exception:
+            pass
 
     # write back
     _write_json(GENERAL_SUMMARY_FILE, {"summaries": summaries})
