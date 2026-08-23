@@ -8,7 +8,10 @@ from parser import parse_and_route
 # Define storage paths globally
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
-HISTORY_FILE = os.path.join(STORAGE_DIR, "allan_prime_history.json")
+RAW_CONTEXT_DIR = os.path.join(STORAGE_DIR, "raw_agent_context")
+MEMORY_DIR = os.path.join(STORAGE_DIR, "memory")
+HISTORY_FILE = os.path.join(RAW_CONTEXT_DIR, "allan_prime.json")
+GENERAL_SUMMARY_FILE = os.path.join(MEMORY_DIR, "general_summarized_event_list.json")
 
 # Interface rules are loaded from settings (Allan_Prime_Settings.json) to avoid duplication.
 # The settings file (created by setup.py) provides the authoritative interface rules.
@@ -124,20 +127,44 @@ def _remove_legacy_thread_files():
     legacy_files = [
         os.path.join(STORAGE_DIR, "internal_chat.txt"),
         os.path.join(STORAGE_DIR, "user_chat.txt"),
+        os.path.join(STORAGE_DIR, "allan_prime_history.json"),
     ]
     for file_path in legacy_files:
         if os.path.exists(file_path):
-            os.remove(file_path)
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
 
 
 def init_storage():
+    # Ensure base storage and subfolders
     if not os.path.exists(STORAGE_DIR):
         os.makedirs(STORAGE_DIR)
+    if not os.path.exists(RAW_CONTEXT_DIR):
+        os.makedirs(RAW_CONTEXT_DIR)
+    if not os.path.exists(MEMORY_DIR):
+        os.makedirs(MEMORY_DIR)
 
+    # remove old legacy files
     _remove_legacy_thread_files()
 
+    # Migrate any old history file into new raw context location if present
+    old_history = os.path.join(STORAGE_DIR, "allan_prime_history.json")
+    if os.path.exists(old_history) and not os.path.exists(HISTORY_FILE):
+        try:
+            os.replace(old_history, HISTORY_FILE)
+        except Exception:
+            pass
+
+    # Ensure history files exist and are valid json
     if not os.path.exists(HISTORY_FILE) or os.path.getsize(HISTORY_FILE) == 0:
         _write_history(_empty_history())
+
+    if not os.path.exists(GENERAL_SUMMARY_FILE) or os.path.getsize(GENERAL_SUMMARY_FILE) == 0:
+        with open(GENERAL_SUMMARY_FILE, "w", encoding="utf-8") as f:
+            json.dump({"summaries": []}, f, ensure_ascii=False, indent=2)
+            f.write("\n")
 
 
 def get_history():

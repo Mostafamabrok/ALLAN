@@ -13,7 +13,7 @@ AGENT_PERMISSIONS = {
 from datetime import datetime, timezone
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-HISTORY_FILE = os.path.join(BASE_DIR, "storage", "allan_prime_history.json")
+HISTORY_FILE = os.path.join(BASE_DIR, "storage", "raw_agent_context", "allan_prime.json")
 
 
 def _append_history_entry(text, thread="internal", called_tools=None):
