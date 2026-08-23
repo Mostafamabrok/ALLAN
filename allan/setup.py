@@ -5,6 +5,7 @@ import json
 import os
 
 SETTINGS_PATH = Path(__file__).parent / "Allan_Prime_Settings.json"
+CONSOLIDATION_SETTINGS_PATH = Path(__file__).parent / "consolidation_settings.json"
 GITIGNORE_PATH = Path(__file__).parent.parent / ".gitignore"
 
 DEFAULT_SETTINGS = {
@@ -50,6 +51,13 @@ DEFAULT_SETTINGS = {
     "system_prompt": "You are ALLAN (Autonomous Language Learning Agent Network), an advanced, highly capable AI assistant.\nYou maintain two conversation threads: internal (private reasoning and tool decisions) and user (visible replies).\nDo all tool work in the internal thread first, then produce a single user-facing reply. Respect the active interface formatting rules.\n\nTOOL USAGE INSTRUCTIONS:\n- All tool calls MUST be emitted inside the internal thread and wrapped exactly in <tool> JSON tags. Do NOT include any explanation or other text inside the tags.\n- Tool format: <tool>{\"name\": \"tool_name\", \"args\": { ... }}</tool>\n\nAVAILABLE TOOL CONTRACTS (examples):\n1) web_search\n   - Purpose: perform a web search for a query and return a short list of results (title, URL, snippet).\n   - Example call: <tool>{\"name\": \"web_search\", \"args\": {\"query\": \"latest AI research\", \"max_results\": 3}}</tool>\n\n2) web_dive\n   - Purpose: fetch and extract readable text content from a single web page URL (no JS execution).\n   - Example call: <tool>{\"name\": \"web_dive\", \"args\": {\"url\": \"https://example.com/article\", \"max_chars\": 2000}}</tool>\n\nRESPONDING RULES:\n- Tools may print internal data, but the final user-facing reply MUST NOT contain raw tool tags or internal reasoning.\n- When a tool finishes, summarize its findings in plain user-friendly language that respects the active interface rules (use <user_reply>...</user_reply> to mark the final reply).\n- If you would otherwise say \"I’m processing that internally before answering,\" automatically run a follow-up internal step to produce the user-facing summary once tool results are available.\n\nKeep all tool logic and intermediate steps internal; only return the final, cleaned-up answer to the user."
 }
 
+# Defaults specifically for the consolidator; kept separate so consolidator can use a lighter/tuned model
+CONSOLIDATION_DEFAULTS = {
+    "model_name": "claude-sonnet-5",
+    "max_tokens": 512,
+    "system_prompt": "You are the ALLAN consolidator. Produce compact JSON summaries of raw agent events. Follow strict JSON output rules.",
+}
+
 
 def ensure_settings():
     # Create settings file with defaults if missing
@@ -59,20 +67,38 @@ def ensure_settings():
             f.write("\n")
         print(f"Created default settings at: {SETTINGS_PATH}")
 
-    # Ensure settings file is gitignored
+    # Create consolidation settings if missing
+    if not CONSOLIDATION_SETTINGS_PATH.exists():
+        try:
+            with open(CONSOLIDATION_SETTINGS_PATH, "w", encoding="utf-8") as cf:
+                json.dump(CONSOLIDATION_DEFAULTS, cf, ensure_ascii=False, indent=2)
+                cf.write("\n")
+            print(f"Created default consolidation settings at: {CONSOLIDATION_SETTINGS_PATH}")
+        except Exception as e:
+            print(f"Warning: could not create consolidation settings: {e}")
+
+    # Ensure settings files are gitignored
     try:
         if GITIGNORE_PATH.exists():
             gitignore_text = GITIGNORE_PATH.read_text(encoding="utf-8")
-            rel = os.path.relpath(SETTINGS_PATH, GITIGNORE_PATH.parent)
-            if rel not in gitignore_text:
+            rel_main = os.path.relpath(SETTINGS_PATH, GITIGNORE_PATH.parent)
+            rel_cons = os.path.relpath(CONSOLIDATION_SETTINGS_PATH, GITIGNORE_PATH.parent)
+            additions = []
+            if rel_main not in gitignore_text:
+                additions.append(rel_main)
+            if rel_cons not in gitignore_text:
+                additions.append(rel_cons)
+            if additions:
                 with open(GITIGNORE_PATH, "a", encoding="utf-8") as g:
-                    g.write(f"\n# ALLAN runtime settings\n{rel}\n")
-                print(f"Added {rel} to .gitignore")
+                    g.write("\n# ALLAN runtime settings\n")
+                    for a in additions:
+                        g.write(f"{a}\n")
+                print(f"Added {', '.join(additions)} to .gitignore")
         else:
             # create a .gitignore at repo root
             with open(GITIGNORE_PATH, "w", encoding="utf-8") as g:
-                g.write(f"# ALLAN runtime settings\n{os.path.relpath(SETTINGS_PATH, GITIGNORE_PATH.parent)}\n")
-            print(f"Created .gitignore and added settings entry: {GITIGNORE_PATH}")
+                g.write(f"# ALLAN runtime settings\n{os.path.relpath(SETTINGS_PATH, GITIGNORE_PATH.parent)}\n{os.path.relpath(CONSOLIDATION_SETTINGS_PATH, GITIGNORE_PATH.parent)}\n")
+            print(f"Created .gitignore and added settings entries: {GITIGNORE_PATH}")
     except Exception as e:
         print(f"Warning: could not update .gitignore: {e}")
 

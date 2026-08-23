@@ -5,16 +5,47 @@ from datetime import datetime, timezone
 
 from llm_api import call_model
 
-# Load settings if present
+# Load consolidation-specific settings if present
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SETTINGS_FILE = os.path.join(BASE_DIR, "Allan_Prime_Settings.json")
+CONSOLIDATION_SETTINGS_FILE = os.path.join(BASE_DIR, "consolidation_settings.json")
+ALLAN_SETTINGS_FILE = os.path.join(BASE_DIR, "Allan_Prime_Settings.json")
 SETTINGS = {}
-if os.path.exists(SETTINGS_FILE):
+if os.path.exists(CONSOLIDATION_SETTINGS_FILE):
     try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as sf:
+        with open(CONSOLIDATION_SETTINGS_FILE, "r", encoding="utf-8") as sf:
             SETTINGS = json.load(sf)
     except Exception:
         SETTINGS = {}
+else:
+    # fall back to Allan_Prime_Settings.json if consolidation settings missing (backwards compatibility)
+    if os.path.exists(ALLAN_SETTINGS_FILE):
+        try:
+            with open(ALLAN_SETTINGS_FILE, "r", encoding="utf-8") as af:
+                SETTINGS = json.load(af)
+        except Exception:
+            SETTINGS = {}
+
+# Determine effective system prompt and warn on potential conflicts
+EFFECTIVE_SYSTEM_PROMPT = SETTINGS.get("system_prompt", "")
+try:
+    if os.path.exists(CONSOLIDATION_SETTINGS_FILE) and os.path.exists(ALLAN_SETTINGS_FILE):
+        with open(ALLAN_SETTINGS_FILE, "r", encoding="utf-8") as af:
+            allan_settings = json.load(af)
+        allan_prompt = allan_settings.get("system_prompt", "")
+        cons_prompt = SETTINGS.get("system_prompt", "")
+        if allan_prompt and cons_prompt and allan_prompt != cons_prompt:
+            # Prefer consolidation-specific prompt; emit a clear warning to stdout so operators notice.
+            import sys
+            warning = (
+                "Warning: consolidation_settings.json and Allan_Prime_Settings.json have different 'system_prompt' values.\n"
+                "Consolidator will use consolidation_settings.json as the authoritative prompt.\n"
+            )
+            try:
+                print(warning, file=sys.stderr)
+            except Exception:
+                pass
+except Exception:
+    pass
 
 MODEL_NAME = SETTINGS.get("model_name")
 MAX_TOKENS = SETTINGS.get("max_tokens")
@@ -92,7 +123,7 @@ def compress_events():
     Produces/updates memory/general_summarized_event_list.json with summarized items referencing raw ids.
     """
     if not MODEL_NAME or not MAX_TOKENS:
-        raise RuntimeError("Missing model settings in Allan_Prime_Settings.json")
+        raise RuntimeError("Missing model settings in consolidation_settings.json or Allan_Prime_Settings.json")
 
     if not os.path.exists(RAW_CONTEXT_DIR):
         return
@@ -153,7 +184,7 @@ def compress_events():
             prompt=prompt,
             model_name=MODEL_NAME,
             max_tokens=MAX_TOKENS,
-            system_prompt=SETTINGS.get("system_prompt", ""),
+            system_prompt=EFFECTIVE_SYSTEM_PROMPT,
         )
 
         # Prefer response text
@@ -206,7 +237,7 @@ def compress_events():
                     prompt=strict_prompt,
                     model_name=MODEL_NAME,
                     max_tokens=MAX_TOKENS,
-                    system_prompt=SETTINGS.get("system_prompt", ""),
+                system_prompt=EFFECTIVE_SYSTEM_PROMPT,
                 )
                 jstart_r = response_retry.find("[")
                 jend_r = response_retry.rfind("]")
@@ -282,7 +313,7 @@ def compress_events():
                             prompt=comp_prompt,
                             model_name=MODEL_NAME,
                             max_tokens=min(400, MAX_TOKENS),
-                            system_prompt=SETTINGS.get("system_prompt", ""),
+                            system_prompt=EFFECTIVE_SYSTEM_PROMPT,
                         )
                         # Extract JSON object from response
                         jstart = response2.find("{")
