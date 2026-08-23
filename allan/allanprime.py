@@ -95,7 +95,13 @@ def _load_history():
             return {"entries": [{"thread": "legacy", "text": str(item)} for item in payload]}
         return _empty_history()
     except (json.JSONDecodeError, TypeError, ValueError):
-        legacy_text = _read_thread(HISTORY_FILE)
+        # If the JSON is malformed, attempt to return the raw file contents as a single legacy entry.
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as lf:
+                legacy_text = lf.read().strip()
+        except Exception:
+            legacy_text = ""
+
         if not legacy_text:
             return _empty_history()
         return {"entries": [{"thread": "legacy", "text": legacy_text}]}
