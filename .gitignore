@@ -2,3 +2,6 @@ venv/
 .env
 __pycache__/
 storage/
+
+# ALLAN runtime settings
+allan\Allan_Prime_Settings.json

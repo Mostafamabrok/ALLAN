@@ -10,61 +10,17 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 HISTORY_FILE = os.path.join(STORAGE_DIR, "allan_prime_history.json")
 
-INTERFACE_RULES = {
-    "terminal": {
-        "label": "terminal",
-        "forbidden": [
-            "markdown headings",
-            "markdown tables",
-            "code fences",
-            "emoji",
-            "long multi-line blocks",
-            "xml-like formatting in user output",
-        ],
-        "required": [
-            "plain text only",
-            "short paragraphs",
-            "no markdown",
-            "no tool tags in user-facing output",
-        ],
-    },
-    "voice": {
-        "label": "voice",
-        "forbidden": [
-            "markdown",
-            "bullet lists",
-            "tool tags",
-            "very long sentences",
-            "excessive punctuation",
-        ],
-        "required": [
-            "spoken-language style",
-            "brief and natural responses",
-            "clear direct answer",
-            "no hidden system formatting",
-        ],
-    },
-    "default": {
-        "label": "unknown",
-        "forbidden": [
-            "raw tool tags",
-            "internal reasoning leaks",
-            "markdown if the interface is plain text",
-        ],
-        "required": [
-            "be interface-aware",
-            "follow the current interface constraints",
-        ],
-    },
-}
+# Interface rules are loaded from settings (Allan_Prime_Settings.json) to avoid duplication.
+# The settings file (created by setup.py) provides the authoritative interface rules.
+INTERFACE_RULES = {}
 
 
 def get_interface_prompt(interface_name="terminal"):
-    interface_type = INTERFACE_RULES.get(interface_name.lower(), INTERFACE_RULES["default"])
-    forbidden = ", ".join(interface_type["forbidden"])
-    required = ", ".join(interface_type["required"])
-    return f"""CURRENT INTERFACE: {interface_type['label']}
-You are running on a {interface_type['label']} interface.
+    interface_type = INTERFACE_RULES.get(interface_name.lower(), INTERFACE_RULES.get("default", {}))
+    forbidden = ", ".join(interface_type.get("forbidden", []))
+    required = ", ".join(interface_type.get("required", []))
+    return f"""CURRENT INTERFACE: {interface_type.get('label','unknown')}
+You are running on a {interface_type.get('label','unknown')} interface.
 Formatting rules for this interface:
 - Forbidden: {forbidden}
 - Required: {required}
@@ -73,28 +29,43 @@ If a tool result needs to be summarized, do it in the correct format for this in
 """
 
 
-SYSTEM_PROMPT = """You are ALLAN (Autonomous Language Learning Agent Network), an advanced, highly capable AI assistant.
-You maintain two conversation threads:
-- internal_chat: private reasoning, tool decisions, and system state. This is never shown to the user.
-- user_chat: the visible conversation with the user. Only the final user-facing message belongs here.
+# Minimal fallback system prompt; the real prompt should come from Allan_Prime_Settings.json
+SYSTEM_PROMPT = "You are ALLAN. Use private internal reasoning, call tools in internal mode, and produce a single user-facing reply. Settings can override this prompt."
 
-RULES:
-1. Do all work and tool logic in the internal thread before deciding the user-facing answer.
-2. If you need to interact with the system, output a tool call in exact <tool> tags in the internal stream.
-3. When you are ready to speak to the user, wrap the final visible response in <user_reply> ... </user_reply>.
-4. Do not expose hidden reasoning to the user.
-5. If no tool is needed, still provide the answer in <user_reply> ... </user_reply>.
-6. After a web_search or web_dive result, summarize what you found in the final user reply instead of saying you are still processing.
-7. Always respect the current interface constraints described in the interface instructions.
+# Load external settings if present (created by setup.py)
+SETTINGS_FILE = os.path.join(BASE_DIR, "Allan_Prime_Settings.json")
+SETTINGS = {}
+if os.path.exists(SETTINGS_FILE):
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as sf:
+            SETTINGS = json.load(sf)
+    except Exception:
+        SETTINGS = {}
 
-TOOL FORMAT:
-<tool>{"name": "the_tool_name", "args": {"argument_key": "argument_value"}}</tool>
+# Load required settings from the settings file. Fail fast if they are missing.
+INTERFACE_RULES = SETTINGS.get("interface_rules")
+if INTERFACE_RULES is None:
+    raise RuntimeError(
+        "Missing 'interface_rules' in Allan_Prime_Settings.json — run allan/setup.py to create default settings."
+    )
 
-Available Tools:
-- web_search: Performs a web search. EXAMPLE: <tool>{"name": "web_search", "args": {"query": "capital of France"}}</tool>.
-- web_dive: Fetches and extracts readable text from a specific page URL. EXAMPLE: <tool>{"name": "web_dive", "args": {"url": "https://example.com/topic", "max_chars": 2500}}</tool>.
+SYSTEM_PROMPT = SETTINGS.get("system_prompt")
+if SYSTEM_PROMPT is None:
+    raise RuntimeError(
+        "Missing 'system_prompt' in Allan_Prime_Settings.json — run allan/setup.py to create default settings."
+    )
 
-Only the final user reply should be visible to the user."""
+MODEL_NAME = SETTINGS.get("model_name")
+if not MODEL_NAME:
+    raise RuntimeError(
+        "Missing 'model_name' in Allan_Prime_Settings.json — run allan/setup.py to create default settings."
+    )
+
+MAX_TOKENS = SETTINGS.get("max_tokens")
+if not isinstance(MAX_TOKENS, int):
+    raise RuntimeError(
+        "Missing or invalid 'max_tokens' (integer) in Allan_Prime_Settings.json — run allan/setup.py to create default settings."
+    )
 
 
 def _empty_history():
@@ -207,8 +178,8 @@ def _follow_up_after_tool(user_input, tool_result, history_context, interface_na
     )
     thinking, response = call_model(
         prompt=f"{history_context}\n{get_interface_prompt(interface_name)}\nALLAN_INTERNAL:\n{prompt}",
-        model_name="claude-sonnet-5",
-        max_tokens=1024,
+        model_name=MODEL_NAME,
+        max_tokens=MAX_TOKENS,
         system_prompt=SYSTEM_PROMPT + "\n" + get_interface_prompt(interface_name),
     )
 
@@ -240,8 +211,8 @@ def ALLAN_prime(user_input, interface_name="terminal"):
 
     thinking, response = call_model(
         prompt=prompt_context,
-        model_name="claude-sonnet-5",
-        max_tokens=1024,
+        model_name=MODEL_NAME,
+        max_tokens=MAX_TOKENS,
         system_prompt=SYSTEM_PROMPT + "\n" + get_interface_prompt(interface_name),
     )
 
