@@ -81,30 +81,59 @@ def _match_query(text, query):
     return q in str(text).lower()
 
 
+def _score_result(item, query):
+    q = str(query or "").lower()
+    if not q:
+        return 0
+
+    score = 0
+    kind = str(item.get("kind") or "").lower()
+    text_blob = ""
+    if kind == "topical":
+        text_blob = " ".join([str(item.get("page") or ""), str(item.get("snippet") or "")])
+    elif kind == "summary":
+        text_blob = " ".join([
+            str(item.get("summary") or ""),
+            str(item.get("compact_summary") or ""),
+            str(item.get("agent") or ""),
+            " ".join(str(r) for r in item.get("references", [])),
+        ])
+    elif kind == "sticky":
+        text_blob = " ".join([str(item.get("title") or ""), str(item.get("text") or ""), " ".join(str(tag) for tag in item.get("tags", []))])
+    else:
+        text_blob = " ".join([str(item.get("thread") or ""), str(item.get("text") or ""), str(item.get("snippet") or "")])
+
+    lower_blob = text_blob.lower()
+    score += 6 if q in lower_blob else 0
+    score += 2 if q.split() and all(part in lower_blob for part in q.split()) else 0
+    score += 1 if kind == "topical" else 0
+    score += 0.5 if kind == "summary" else 0
+    return score
+
+
 def search_memory(query, scope="all", limit=10):
     _ensure_layout()
     q = str(query or "").strip()
     if not q:
         return {"query": q, "count": 0, "results": []}
 
-    results = []
     scope_key = str(scope or "all").lower()
 
-    if scope_key in ("all", "sticky", "sticky_notes"):
-        sticky = _read_json(STICKY_FILE, {"notes": []}).get("notes", [])
-        for note in sticky:
-            haystack = " ".join([note.get("text", ""), " ".join(note.get("tags", []))])
-            if _match_query(haystack, q):
-                results.append({
-                    "kind": "sticky",
-                    "id": note.get("id"),
-                    "title": note.get("title") or "Sticky Note",
-                    "text": note.get("text", ""),
-                    "tags": note.get("tags", []),
-                    "snippet": _snippet_from_text(note.get("text", ""), q),
+    def _collect_topical_matches():
+        matches = []
+        for path in sorted(TOPICAL_DIR.glob("*.md")):
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            if _match_query(text, q) or _match_query(path.stem, q):
+                matches.append({
+                    "kind": "topical",
+                    "page": path.name,
+                    "path": str(path),
+                    "snippet": _snippet_from_text(text, q),
                 })
+        return matches
 
-    if scope_key in ("all", "summary", "summaries", "general_summary", "gsumel"):
+    def _collect_summary_matches():
+        matches = []
         summaries = _read_json(GENERAL_SUMMARY_FILE, {"summaries": []}).get("summaries", [])
         for item in summaries:
             haystack = " ".join([
@@ -113,7 +142,7 @@ def search_memory(query, scope="all", limit=10):
                 " ".join(str(r) for r in item.get("references", [])),
             ])
             if _match_query(haystack, q):
-                results.append({
+                matches.append({
                     "kind": "summary",
                     "id": item.get("id"),
                     "agent": item.get("agent"),
@@ -122,25 +151,32 @@ def search_memory(query, scope="all", limit=10):
                     "references": item.get("references", []),
                     "snippet": _snippet_from_text(item.get("summary", ""), q),
                 })
+        return matches
 
-    if scope_key in ("all", "topical", "pages", "notes"):
-        for path in sorted(TOPICAL_DIR.glob("*.md")):
-            text = path.read_text(encoding="utf-8", errors="ignore")
-            if _match_query(text, q) or _match_query(path.stem, q):
-                results.append({
-                    "kind": "topical",
-                    "page": path.name,
-                    "path": str(path),
-                    "snippet": _snippet_from_text(text, q),
+    def _collect_sticky_matches():
+        matches = []
+        sticky = _read_json(STICKY_FILE, {"notes": []}).get("notes", [])
+        for note in sticky:
+            haystack = " ".join([note.get("text", ""), " ".join(note.get("tags", []))])
+            if _match_query(haystack, q):
+                matches.append({
+                    "kind": "sticky",
+                    "id": note.get("id"),
+                    "title": note.get("title") or "Sticky Note",
+                    "text": note.get("text", ""),
+                    "tags": note.get("tags", []),
+                    "snippet": _snippet_from_text(note.get("text", ""), q),
                 })
+        return matches
 
-    if scope_key in ("all", "raw", "agent", "context"):
+    def _collect_raw_matches():
+        matches = []
         for path in sorted(RAW_CONTEXT_DIR.glob("*.json")):
             payload = _read_json(path, {"entries": []})
             for entry in payload.get("entries", []):
                 text = entry.get("text", "")
                 if _match_query(text, q):
-                    results.append({
+                    matches.append({
                         "kind": "raw",
                         "agent": path.name,
                         "id": entry.get("id"),
@@ -148,19 +184,59 @@ def search_memory(query, scope="all", limit=10):
                         "timestamp": entry.get("timestamp"),
                         "snippet": _snippet_from_text(text, q),
                     })
+        return matches
 
-    deduped = []
-    seen = set()
-    for item in results:
-        marker = json.dumps(item, sort_keys=True, ensure_ascii=False)
-        if marker not in seen:
-            deduped.append(item)
-            seen.add(marker)
+    def finalize(matches):
+        ordered = []
+        for item in matches:
+            item_copy = dict(item)
+            item_copy["_score"] = _score_result(item_copy, q)
+            ordered.append(item_copy)
+        ordered.sort(key=lambda item: (self_priority(item.get("kind", "")), -item.get("_score", 0)))
 
-    if limit is not None:
-        deduped = deduped[: int(limit)]
+        deduped = []
+        seen = set()
+        for item in ordered:
+            item.pop("_score", None)
+            marker = json.dumps(item, sort_keys=True, ensure_ascii=False)
+            if marker not in seen:
+                deduped.append(item)
+                seen.add(marker)
+        if limit is not None:
+            deduped = deduped[: int(limit)]
+        return deduped
 
-    return {"query": q, "count": len(deduped), "results": deduped}
+    if scope_key in ("all", "topical", "pages", "notes"):
+        topical = _collect_topical_matches()
+        if topical:
+            return {"query": q, "count": len(topical), "results": finalize(topical)}
+
+    if scope_key in ("all", "summary", "summaries", "general_summary", "gsumel"):
+        summary = _collect_summary_matches()
+        if summary:
+            return {"query": q, "count": len(summary), "results": finalize(summary)}
+
+    if scope_key in ("all", "sticky", "sticky_notes"):
+        sticky = _collect_sticky_matches()
+        if sticky:
+            return {"query": q, "count": len(sticky), "results": finalize(sticky)}
+
+    if scope_key in ("all", "raw", "agent", "context"):
+        raw = _collect_raw_matches()
+        if raw:
+            return {"query": q, "count": len(raw), "results": finalize(raw)}
+
+    return {"query": q, "count": 0, "results": []}
+
+
+def self_priority(kind):
+    priorities = {
+        "topical": 0,
+        "summary": 1,
+        "sticky": 2,
+        "raw": 3,
+    }
+    return priorities.get(str(kind).lower(), 99)
 
 
 def retrieve_memory(kind="all", key=None, limit=20):
