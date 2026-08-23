@@ -144,17 +144,43 @@ def get_history():
     return _load_history()
 
 
-def append_to_history(text, thread="system"):
+from datetime import datetime, timezone
+
+
+def append_to_history(text, thread="system", called_tools=None):
+    """Append a history entry with id, timestamp, thread, text, and optional called_tools.
+
+    called_tools should be a list of dictionaries: [{"name": ..., "args": {...}}]
+    """
     history = _load_history()
-    history.setdefault("entries", []).append({
+    entries = history.setdefault("entries", [])
+
+    # determine next id
+    next_id = 1
+    if entries:
+        try:
+            max_id = max(int(e.get("id", 0)) for e in entries)
+            next_id = max_id + 1
+        except Exception:
+            next_id = len(entries) + 1
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    entry = {
+        "id": next_id,
         "thread": thread,
+        "timestamp": timestamp,
         "text": text,
-    })
+    }
+    if called_tools:
+        entry["called_tools"] = called_tools
+
+    entries.append(entry)
     _write_history(history)
 
 
-def append_to_internal_chat(text):
-    append_to_history(text, thread="internal")
+def append_to_internal_chat(text, called_tools=None):
+    append_to_history(text, thread="internal", called_tools=called_tools)
 
 
 def append_to_user_chat(text):
