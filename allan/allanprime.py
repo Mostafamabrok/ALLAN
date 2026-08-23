@@ -123,6 +123,37 @@ def _format_history_for_prompt(history):
     return "\n".join(formatted)
 
 
+def _format_sticky_notes_for_prompt(limit=None):
+    sticky_path = os.path.join(MEMORY_DIR, "sticky_notes.json")
+    try:
+        if not os.path.exists(sticky_path):
+            return "ACTIVE STICKY NOTES:\nNone"
+        with open(sticky_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return "ACTIVE STICKY NOTES:\nNone"
+
+    notes = payload.get("notes", []) if isinstance(payload, dict) else []
+    if not notes:
+        return "ACTIVE STICKY NOTES:\nNone"
+
+    ordered = sorted(notes, key=lambda n: str(n.get("updated_at") or n.get("created_at") or ""), reverse=True)
+    if limit is not None:
+        ordered = ordered[:limit]
+
+    concise = []
+    for note in ordered:
+        updated = note.get("updated_at") or note.get("created_at") or "unknown"
+        text = str(note.get("text") or "").strip()
+        if not text:
+            continue
+        concise.append(f"- {updated}: {text}")
+
+    if not concise:
+        return "ACTIVE STICKY NOTES:\nNone"
+    return "ACTIVE STICKY NOTES:\n" + "\n".join(concise)
+
+
 def _remove_legacy_thread_files():
     legacy_files = [
         os.path.join(STORAGE_DIR, "internal_chat.txt"),
@@ -235,8 +266,9 @@ def _follow_up_after_tool(user_input, tool_result, history_context, interface_na
         f"User request: {user_input}\n\n"
         f"Tool result:\n{tool_result}"
     )
+    sticky_context = _format_sticky_notes_for_prompt()
     thinking, response = call_model(
-        prompt=f"{history_context}\n{get_interface_prompt(interface_name)}\nALLAN_INTERNAL:\n{prompt}",
+        prompt=f"{history_context}\n{sticky_context}\n{get_interface_prompt(interface_name)}\nALLAN_INTERNAL:\n{prompt}",
         model_name=MODEL_NAME,
         max_tokens=MAX_TOKENS,
         system_prompt=SYSTEM_PROMPT + "\n" + get_interface_prompt(interface_name),
@@ -291,7 +323,8 @@ def ALLAN_prime(user_input, interface_name="terminal"):
     append_to_user_chat(f"User: {user_input}")
 
     history = get_history()
-    prompt_context = f"{_format_history_for_prompt(history)}\n{get_interface_prompt(interface_name)}\nALLAN_INTERNAL:"
+    sticky_context = _format_sticky_notes_for_prompt()
+    prompt_context = f"{_format_history_for_prompt(history)}\n{sticky_context}\n{get_interface_prompt(interface_name)}\nALLAN_INTERNAL:"
 
     thinking, response = call_model(
         prompt=prompt_context,
@@ -308,15 +341,20 @@ def ALLAN_prime(user_input, interface_name="terminal"):
 
     append_to_internal_chat(f"ALLAN_INTERNAL: {response}")
 
-    tool_result = None
-    tool_match = re.search(r'<tool>(.*?)</tool>', response, re.DOTALL)
-    if tool_match:
-        tool_result = parse_and_route(response, agent_id="ALLAN_Prime")
-        if tool_result:
-            cleaned_response = response[:tool_match.start()] + response[tool_match.end():]
+    route_result = None
+    if re.search(r'<(?:tool|memory)>(.*?)</(?:tool|memory)>', response, re.DOTALL):
+        route_result = parse_and_route(response, agent_id="ALLAN_Prime")
+        if route_result:
+            cleaned_response = re.sub(r'<(?:tool|memory)>(.*?)</(?:tool|memory)>', '', response, flags=re.DOTALL)
             cleaned_response = re.sub(r"\s+", " ", cleaned_response).strip()
-            append_to_internal_chat(f"[SYSTEM TOOL EXECUTION]: {tool_result}")
+            append_to_internal_chat(f"[SYSTEM TOOL EXECUTION]: {route_result}")
             response = cleaned_response
+
+    if route_result is not None and re.search(r"\[(?:PARSER|MEMORY|TOOL) ERROR\]", str(route_result), flags=re.IGNORECASE):
+        final_user_reply = "The previous tool or memory call failed because the payload was invalid JSON. No action was executed."
+        append_to_internal_chat(f"[SYSTEM TOOL EXECUTION FAILURE]: {route_result}")
+        append_to_user_chat(f"ALLAN: {final_user_reply}")
+        return final_user_reply
 
     user_reply = _extract_user_reply(response)
     if user_reply:
@@ -327,15 +365,18 @@ def ALLAN_prime(user_input, interface_name="terminal"):
     if not final_user_reply:
         final_user_reply = "I’m processing that internally before answering."
 
-    if final_user_reply == "I’m processing that internally before answering." and tool_result is not None:
-        follow_up_reply = _follow_up_after_tool(
-            user_input,
-            tool_result,
-            _format_history_for_prompt(get_history()),
-            interface_name=interface_name,
-        )
-        if follow_up_reply:
-            final_user_reply = follow_up_reply
+    if final_user_reply == "I’m processing that internally before answering." and route_result is not None:
+        if re.search(r"\[(?:PARSER|MEMORY|TOOL) ERROR\]", str(route_result), flags=re.IGNORECASE):
+            final_user_reply = "The previous tool or memory call failed because the payload was invalid JSON. No action was executed."
+        else:
+            follow_up_reply = _follow_up_after_tool(
+                user_input,
+                route_result,
+                _format_history_for_prompt(get_history()),
+                interface_name=interface_name,
+            )
+            if follow_up_reply:
+                final_user_reply = follow_up_reply
 
     append_to_user_chat(f"ALLAN: {final_user_reply}")
     return final_user_reply
