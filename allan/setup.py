@@ -9,8 +9,8 @@ CONSOLIDATION_SETTINGS_PATH = Path(__file__).parent / "consolidation_settings.js
 GITIGNORE_PATH = Path(__file__).parent.parent / ".gitignore"
 
 DEFAULT_SETTINGS = {
-    "model_name": "claude-sonnet-5",
-    "max_tokens": 1024,
+    "model_name": "claude-haiku-4-5",
+    "max_tokens": 312,
     "default_interface": "terminal",
     "available_tools": ["web_search", "web_dive"],
     "interface_rules": {
