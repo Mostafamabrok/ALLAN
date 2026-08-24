@@ -352,17 +352,29 @@ def ALLAN_prime(user_input, interface_name="terminal"):
     append_to_internal_chat(f"ALLAN_INTERNAL: {response}")
 
     route_result = None
+    tool_was_used = False
     if re.search(r'<(?:tool|memory)>(.*?)</(?:tool|memory)>', response, re.DOTALL):
+        tool_was_used = True
         route_result = parse_and_route(response, agent_id="ALLAN_Prime")
         if route_result:
-            cleaned_response = re.sub(r'<(?:tool|memory)>(.*?)</(?:tool|memory)>', '', response, flags=re.DOTALL)
-            cleaned_response = re.sub(r"\s+", " ", cleaned_response).strip()
             append_to_internal_chat(f"[SYSTEM TOOL EXECUTION]: {route_result}")
-            response = cleaned_response
 
     if _route_result_has_failure(route_result):
         final_user_reply = "The previous tool or memory call failed, so no action was executed."
         append_to_internal_chat(f"[SYSTEM TOOL EXECUTION FAILURE]: {route_result}")
+        append_to_user_chat(f"ALLAN: {final_user_reply}")
+        return final_user_reply
+
+    # Tool-backed turns must wait for the tool result before a user-facing answer is generated.
+    # Any answer generated in the same turn is treated as internal-only and discarded.
+    if tool_was_used and route_result is not None:
+        follow_up_reply = _follow_up_after_tool(
+            user_input,
+            route_result,
+            _format_history_for_prompt(get_history()),
+            interface_name=interface_name,
+        )
+        final_user_reply = follow_up_reply or "I’ve completed the internal check and am ready to answer."
         append_to_user_chat(f"ALLAN: {final_user_reply}")
         return final_user_reply
 
