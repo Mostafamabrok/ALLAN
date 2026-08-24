@@ -13,6 +13,10 @@ def terminal_interface():
         user_input = input("\nYou: ")
         
         if user_input.lower() == "exit":
+            from allanprime import has_pending_tasks
+            if has_pending_tasks():
+                print("Cannot exit while tasks remain. Finish or mark the task list as done first.")
+                continue
             print("Shutting down ALLAN terminal. Goodbye!")
             break
 
