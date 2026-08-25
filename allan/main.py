@@ -1,21 +1,34 @@
-from llm_api import call_model
-from allanprime import init_storage, clear_history, ALLAN_prime
+from allanprime import (
+    ALLAN_prime,
+    INTERFACE_RULES,
+    clear_history,
+    has_pending_tasks,
+    init_storage,
+)
+from llm_api import usage_report
+from user_interaction_space import make_progress_handler
+
+INTERFACE = "terminal"
+
 
 def terminal_interface():
     """User-facing loop. Routes data to ALLAN_prime."""
-    # Ensure storage exists before starting the chat loop
     init_storage()
-    
+
+    # The engine emits structured progress events; this decides what a terminal
+    # shows. A voice front end would build the same handler with its own name
+    # and get near-silence instead, without the engine changing at all.
+    show_progress = make_progress_handler(INTERFACE, INTERFACE_RULES, sink=print)
+
     print("Welcome to the ALLAN terminal interface!")
-    print("Type 'exit' to quit or 'clear' to wipe persistent memory.")
+    print("Commands: 'exit' to quit, 'clear' to wipe history, 'usage' for token spend.")
 
     while True:
         user_input = input("\nYou: ")
-        
+
         if user_input.lower() == "exit":
-            from allanprime import has_pending_tasks
             if has_pending_tasks():
-                print("Cannot exit while tasks remain. Finish or mark the task list as done first.")
+                print("Tasks are still pending. Finish them, or type 'clear tasks' to drop them.")
                 continue
             print("Shutting down ALLAN terminal. Goodbye!")
             break
@@ -24,14 +37,16 @@ def terminal_interface():
             clear_history()
             print("Persistent conversation history cleared.")
             continue
-            
+
+        if user_input.lower() == "usage":
+            print(usage_report())
+            continue
+
         if not user_input.strip():
             continue
-        
-        # Route the input to the main engine with the active interface context.
-        response = ALLAN_prime(user_input, interface_name="terminal")
-        
-        # Output the generated response to the user space
+
+        response = ALLAN_prime(user_input, interface_name=INTERFACE, on_progress=show_progress)
+
         print(f"ALLAN: {response}")
 
 

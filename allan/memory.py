@@ -74,41 +74,81 @@ def _snippet_from_text(text, query=None, max_len=180):
     return text[:max_len] + ("..." if len(text) > max_len else "")
 
 
+def _tokenize(text):
+    return [t for t in re.split(r"[^a-z0-9]+", str(text or "").lower()) if t]
+
+
 def _match_query(text, query):
+    """True if the text contains the whole query or any single query term.
+
+    Term-level matching matters: a search for "monthly budget rocket" should
+    still surface the budget page even though that exact phrase appears nowhere.
+    """
     if not query:
         return True
-    q = str(query).lower()
-    return q in str(text).lower()
+    blob = str(text or "").lower()
+    if str(query).lower() in blob:
+        return True
+    terms = _tokenize(query)
+    if not terms:
+        return False
+    blob_terms = set(_tokenize(blob))
+    return any(term in blob_terms for term in terms)
 
 
-def _score_result(item, query):
-    q = str(query or "").lower()
-    if not q:
-        return 0
+# Small nudge applied after relevance, used only to break ties between items
+# that matched the query equally well.
+KIND_TIEBREAK = {"topical": 0.3, "sticky": 0.2, "summary": 0.1, "raw": 0.0}
 
-    score = 0
+
+def _blob_for(item):
     kind = str(item.get("kind") or "").lower()
-    text_blob = ""
     if kind == "topical":
-        text_blob = " ".join([str(item.get("page") or ""), str(item.get("snippet") or "")])
-    elif kind == "summary":
-        text_blob = " ".join([
+        return " ".join([str(item.get("page") or ""), str(item.get("snippet") or "")])
+    if kind == "summary":
+        return " ".join([
             str(item.get("summary") or ""),
             str(item.get("compact_summary") or ""),
             str(item.get("agent") or ""),
             " ".join(str(r) for r in item.get("references", [])),
         ])
-    elif kind == "sticky":
-        text_blob = " ".join([str(item.get("title") or ""), str(item.get("text") or ""), " ".join(str(tag) for tag in item.get("tags", []))])
-    else:
-        text_blob = " ".join([str(item.get("thread") or ""), str(item.get("text") or ""), str(item.get("snippet") or "")])
+    if kind == "sticky":
+        return " ".join([
+            str(item.get("title") or ""),
+            str(item.get("text") or ""),
+            " ".join(str(tag) for tag in item.get("tags", [])),
+        ])
+    return " ".join([
+        str(item.get("thread") or ""),
+        str(item.get("text") or ""),
+        str(item.get("snippet") or ""),
+    ])
 
-    lower_blob = text_blob.lower()
-    score += 6 if q in lower_blob else 0
-    score += 2 if q.split() and all(part in lower_blob for part in q.split()) else 0
-    score += 1 if kind == "topical" else 0
-    score += 0.5 if kind == "summary" else 0
-    return score
+
+def _score_result(item, query):
+    """Relevance first, memory tier only as a tiebreak.
+
+    The old version sorted by tier before score, so any topical hit outranked
+    an exact sticky-note match. Score now dominates.
+    """
+    q = str(query or "").strip().lower()
+    if not q:
+        return 0.0
+
+    blob = _blob_for(item).lower()
+    terms = _tokenize(q)
+    blob_terms = set(_tokenize(blob))
+
+    score = 0.0
+    if q in blob:
+        score += 10.0                                    # exact phrase
+    if terms:
+        hits = sum(1 for term in terms if term in blob_terms)
+        if hits == len(terms):
+            score += 5.0                                 # every term present
+        score += 2.0 * (hits / len(terms))               # partial credit
+
+    return score + KIND_TIEBREAK.get(str(item.get("kind") or "").lower(), 0.0)
 
 
 def search_memory(query, scope="all", limit=10):
@@ -192,7 +232,8 @@ def search_memory(query, scope="all", limit=10):
             item_copy = dict(item)
             item_copy["_score"] = _score_result(item_copy, q)
             ordered.append(item_copy)
-        ordered.sort(key=lambda item: (self_priority(item.get("kind", "")), -item.get("_score", 0)))
+        # Relevance first. Tier is already folded into the score as a tiebreak.
+        ordered.sort(key=lambda item: -item.get("_score", 0))
 
         deduped = []
         seen = set()
@@ -202,31 +243,50 @@ def search_memory(query, scope="all", limit=10):
             if marker not in seen:
                 deduped.append(item)
                 seen.add(marker)
-        if limit is not None:
-            deduped = deduped[: int(limit)]
         return deduped
 
-    if scope_key in ("all", "topical", "pages", "notes"):
-        topical = _collect_topical_matches()
-        if topical:
-            return {"query": q, "count": len(topical), "results": finalize(topical)}
+    # Every tier whose alias set contains the requested scope gets searched.
+    # "all" means all of them -- it used to mean "the first tier that hits",
+    # so one weak topical match could hide every sticky note and summary.
+    collectors = (
+        (("all", "topical", "pages", "notes"), _collect_topical_matches),
+        (("all", "summary", "summaries", "general_summary", "gsumel"), _collect_summary_matches),
+        (("all", "sticky", "sticky_notes"), _collect_sticky_matches),
+        (("all", "raw", "agent", "context"), _collect_raw_matches),
+    )
 
-    if scope_key in ("all", "summary", "summaries", "general_summary", "gsumel"):
-        summary = _collect_summary_matches()
-        if summary:
-            return {"query": q, "count": len(summary), "results": finalize(summary)}
+    matches = []
+    scopes_searched = []
+    for aliases, collect in collectors:
+        if scope_key in aliases:
+            scopes_searched.append(aliases[1])
+            try:
+                matches.extend(collect())
+            except Exception:
+                pass
 
-    if scope_key in ("all", "sticky", "sticky_notes"):
-        sticky = _collect_sticky_matches()
-        if sticky:
-            return {"query": q, "count": len(sticky), "results": finalize(sticky)}
+    if not scopes_searched:
+        return {
+            "query": q,
+            "scope": scope_key,
+            "error": f"Unknown scope '{scope_key}'. Use one of: topical, summary, sticky, raw, all.",
+            "count": 0,
+            "results": [],
+        }
 
-    if scope_key in ("all", "raw", "agent", "context"):
-        raw = _collect_raw_matches()
-        if raw:
-            return {"query": q, "count": len(raw), "results": finalize(raw)}
+    ranked = finalize(matches)
+    total = len(ranked)
+    if limit is not None:
+        ranked = ranked[: int(limit)]
 
-    return {"query": q, "count": 0, "results": []}
+    return {
+        "query": q,
+        "scopes_searched": scopes_searched,
+        "count": len(ranked),
+        "total_matches": total,
+        "truncated": total > len(ranked),
+        "results": ranked,
+    }
 
 
 def self_priority(kind):

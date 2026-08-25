@@ -10,12 +10,25 @@ GITIGNORE_PATH = Path(__file__).parent.parent / ".gitignore"
 
 DEFAULT_SETTINGS = {
     "model_name": "claude-haiku-4-5",
-    "max_tokens": 312,
+    "max_tokens": 724,
     "default_interface": "terminal",
     "available_tools": ["web_search", "web_dive"],
+    # Agent loop guards. The loop runs until the task chain is finished; these
+    # are the backstops that stop a stuck run from burning tokens forever.
+    # The step budget scales with the planned chain: base + per-task allowance,
+    # recomputed each step so discovering more work extends the run.
+    # Setting "max_iterations" instead pins a flat cap and overrides these.
+    "base_step_budget": 8,           # steps available before any tasks are planned
+    "steps_per_task": 4,             # extra steps granted per task on the board
+    "max_steps_hard_cap": 40,        # absolute ceiling, whatever the chain says
+    "max_consecutive_failures": 3,   # give up after this many failing steps in a row
+    "max_early_exit_nudges": 2,      # times ALLAN is pushed back for finishing with tasks pending
     "interface_rules": {
         "terminal": {
             "label": "terminal",
+            # How the progress stream is rendered. Styles live in
+            # user_interaction_space.py: verbose | minimal | spoken | silent.
+            "progress": {"style": "verbose"},
             "forbidden": [
                 "markdown headings",
                 "markdown tables",
@@ -33,18 +46,26 @@ DEFAULT_SETTINGS = {
         },
         "voice": {
             "label": "voice",
+            # Near-silent while working: a spoken interface narrating its own
+            # task ids is unlistenable. It works quietly, then answers.
+            "progress": {"style": "spoken"},
             "forbidden": [
                 "markdown",
                 "bullet lists",
                 "tool tags",
                 "very long sentences",
-                "excessive punctuation"
+                "excessive punctuation",
+                "task ids such as task-1",
+                "step numbers",
+                "internal system vocabulary (task chain, sticky note, topical page, opcode)",
+                "file paths"
             ],
             "required": [
                 "spoken-language style",
                 "brief and natural responses",
                 "clear direct answer",
-                "no hidden system formatting"
+                "no hidden system formatting",
+                "describe outcomes the way a person would say them out loud"
             ]
         }
     },

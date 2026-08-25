@@ -3,7 +3,19 @@ import os
 import re
 
 from llm_api import call_model
-from parser import parse_and_route
+from parser import execute_actions, parse_actions
+from user_interaction_space import sanitize_reply
+from tasks import (
+    TASKS_FILE,
+    clear_tasks,
+    current_task,
+    format_task_state,
+    get_pending_tasks,
+    has_pending_tasks,
+    list_tasks,
+    mark_task_done,
+    set_task_list,
+)
 
 # Define storage paths globally
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,6 +41,15 @@ Formatting rules for this interface:
 - Required: {required}
 Never output forbidden formatting to the user on this interface.
 If a tool result needs to be summarized, do it in the correct format for this interface without exposing internal specs or tool tags.
+
+INTERNAL VOCABULARY IS NEVER USER-FACING (all interfaces):
+The task chain, step numbers and opcodes are machinery for running the work.
+They are not things the user asked about, and on a spoken interface they are
+unintelligible. In your reply, never say "task-1", "task 2", "step 3", "the task
+chain", "memory search", "sticky note", "topical page", "opcode", or a
+storage/ file path. Say what you did in the user's own terms instead: not
+"I completed task 2 and wrote a sticky note", but "I saved that for later".
+Report outcomes, not the bookkeeping you used to reach them.
 """
 
 
@@ -70,7 +91,33 @@ if not isinstance(MAX_TOKENS, int):
         "Missing or invalid 'max_tokens' (integer) in Allan_Prime_Settings.json — run allan/setup.py to create default settings."
     )
 
-TASKS_FILE = os.path.join(MEMORY_DIR, "task_list.json")
+# Agent loop limits. Overridable from Allan_Prime_Settings.json; these are the
+# defaults so an existing settings file keeps working without edits.
+#
+# The step budget scales with the size of the chain ALLAN actually planned. A
+# flat ceiling cut long jobs off mid-work while still being far more than a
+# two-task job needs. Budget is recomputed each step, and grows if ALLAN adds
+# tasks, so discovering more work mid-run extends the run instead of starving it.
+BASE_STEP_BUDGET = int(SETTINGS.get("base_step_budget", 8))
+STEPS_PER_TASK = int(SETTINGS.get("steps_per_task", 4))
+MAX_STEPS_HARD_CAP = int(SETTINGS.get("max_steps_hard_cap", 40))
+MAX_CONSECUTIVE_FAILURES = int(SETTINGS.get("max_consecutive_failures", 3))
+MAX_EARLY_EXIT_NUDGES = int(SETTINGS.get("max_early_exit_nudges", 2))
+
+# Back-compat: an existing settings file with max_iterations still pins the cap.
+_LEGACY_MAX_ITERATIONS = SETTINGS.get("max_iterations")
+
+
+def step_budget():
+    """How many steps this run gets, given the work currently on the board.
+
+    Derived from the TOTAL task count, not the pending count -- pending shrinks
+    as tasks complete, which would shrink the budget out from under a run that
+    is making good progress.
+    """
+    if _LEGACY_MAX_ITERATIONS:
+        return int(_LEGACY_MAX_ITERATIONS)
+    return min(MAX_STEPS_HARD_CAP, BASE_STEP_BUDGET + STEPS_PER_TASK * len(list_tasks()))
 
 
 def _empty_history():
@@ -247,191 +294,42 @@ def append_to_user_chat(text):
     append_to_history(text, thread="user")
 
 
-def _ensure_task_file():
-    os.makedirs(MEMORY_DIR, exist_ok=True)
-    if not os.path.exists(TASKS_FILE):
-        with open(TASKS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"tasks": []}, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-
-
-def _load_task_list():
-    _ensure_task_file()
-    try:
-        with open(TASKS_FILE, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        if isinstance(payload, dict) and isinstance(payload.get("tasks"), list):
-            return payload["tasks"]
-    except Exception:
-        pass
-    return []
-
-
-def _save_task_list(tasks):
-    _ensure_task_file()
-    with open(TASKS_FILE, "w", encoding="utf-8") as f:
-        json.dump({"tasks": tasks}, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-
-
-def _normalize_task_title(raw_title):
-    title = str(raw_title or "").strip()
-    title = re.sub(r"^[\-\*•\d\s\.)]+", "", title)
-    title = re.sub(r"\s+", " ", title).strip()
-    return title
-
-
-def _parse_task_candidates(raw_text):
-    text = str(raw_text or "").strip()
-    if not text:
-        return []
-
-    cleaned = text
-    for prefix in ["set task list", "set todo list", "task list", "todo list", "tasks:", "todo:", "tasks", "todo"]:
-        if cleaned.lower().startswith(prefix):
-            cleaned = cleaned[len(prefix):].strip()
-            break
-    cleaned = cleaned.strip(":- ")
-    if not cleaned:
-        return []
-
-    parts = re.split(r"\n|;|\|", cleaned)
-    candidates = []
-    for part in parts:
-        for sub in re.split(r",\s*", part):
-            item = _normalize_task_title(sub)
-            if item and item.lower() not in {"done", "completed", "finished"}:
-                candidates.append(item)
-    return candidates
-
-
-def set_task_list(raw_text_or_list):
-    if isinstance(raw_text_or_list, list):
-        titles = [str(item).strip() for item in raw_text_or_list if str(item).strip()]
-    else:
-        titles = _parse_task_candidates(raw_text_or_list)
-
-    tasks = []
-    timestamp = datetime.now(timezone.utc).isoformat()
-    for index, title in enumerate(titles, start=1):
-        tasks.append({
-            "id": f"task-{index}",
-            "title": title,
-            "status": "pending",
-            "created_at": timestamp,
-            "updated_at": timestamp,
-        })
-
-    _save_task_list(tasks)
-    return tasks
-
-
-def list_tasks():
-    return _load_task_list()
-
-
-def get_pending_tasks():
-    return [task for task in _load_task_list() if str(task.get("status", "pending")).lower() != "done"]
-
-
-def has_pending_tasks():
-    return bool(get_pending_tasks())
-
-
-def mark_task_done(selector):
-    tasks = _load_task_list()
-    if not tasks:
-        return None
-
-    if isinstance(selector, int):
-        index = selector - 1
-        if 0 <= index < len(tasks):
-            tasks[index]["status"] = "done"
-            tasks[index]["updated_at"] = datetime.now(timezone.utc).isoformat()
-            _save_task_list(tasks)
-            return tasks[index]
-        return None
-
-    selector_norm = str(selector).strip().lower()
-    for task in tasks:
-        if str(task.get("id", "")).lower() == selector_norm or str(task.get("title", "")).lower() == selector_norm:
-            task["status"] = "done"
-            task["updated_at"] = datetime.now(timezone.utc).isoformat()
-            _save_task_list(tasks)
-            return task
-
-    try:
-        index = int(selector_norm) - 1
-        if 0 <= index < len(tasks):
-            tasks[index]["status"] = "done"
-            tasks[index]["updated_at"] = datetime.now(timezone.utc).isoformat()
-            _save_task_list(tasks)
-            return tasks[index]
-    except ValueError:
-        pass
-
-    return None
-
-
-def clear_tasks():
-    _save_task_list([])
-    return []
-
-
-def _format_task_prompt_context():
-    tasks = list_tasks()
-    if not tasks:
-        return "ACTIVE TASK CHAIN:\nNone"
-
-    pending = [task for task in tasks if str(task.get("status", "pending")).lower() != "done"]
-    if not pending:
-        return "ACTIVE TASK CHAIN:\nAll tasks are complete."
-
-    lines = [f"{index + 1}. {task.get('title')} ({task.get('status', 'pending')})" for index, task in enumerate(tasks)]
-    next_task = pending[0].get("title")
-    return "ACTIVE TASK CHAIN:\n" + "\n".join(lines) + f"\nNEXT PRIORITY: execute task 1 now: {next_task}. Do not answer with a general summary before working the current task."
-
-
 def handle_task_command(user_input):
+    """Plain-text task commands typed by the user. ALLAN itself uses <task>."""
     text = str(user_input or "").strip()
     if not text:
         return None
     lower = text.lower()
 
     if lower in {"tasks", "list tasks", "show tasks", "task list", "todo list"}:
-        tasks = list_tasks()
-        if not tasks:
-            return "There are no active tasks yet."
-        lines = [f"{index + 1}. {task.get('title')} ({task.get('status', 'pending')})" for index, task in enumerate(tasks)]
-        return "Current tasks:\n" + "\n".join(lines)
+        return format_task_state() if list_tasks() else "There are no active tasks yet."
 
     if lower in {"clear tasks", "clear task list", "reset tasks", "wipe tasks"}:
         clear_tasks()
         return "Task list cleared."
 
     if lower in {"mark all tasks done", "complete all tasks", "finish all tasks"}:
-        tasks = _load_task_list()
-        for task in tasks:
-            task["status"] = "done"
-            task["updated_at"] = datetime.now(timezone.utc).isoformat()
-        _save_task_list(tasks)
+        for task in list_tasks():
+            mark_task_done(task.get("id"))
         return "All tasks marked as done."
 
-    if re.match(r"^(mark\s+)?(task|todo)\s+.*\s+(done|complete|finished)$", lower):
-        match = re.match(r"^(?:mark\s+)?(?:task|todo)\s+(.+?)\s+(?:done|complete|finished)$", text, flags=re.IGNORECASE)
-        if match:
-            target = match.group(1).strip()
-            task = mark_task_done(target)
-            if task:
-                return f"Marked task as done: {task.get('title')}"
-            return f"I could not find the task '{target}' to mark done."
+    match = re.match(r"^(?:mark\s+)?(?:task|todo)\s+(.+?)\s+(?:done|complete|finished)$",
+                     text, flags=re.IGNORECASE)
+    if match:
+        target = match.group(1).strip()
+        task = mark_task_done(target)
+        if task:
+            return f"Marked task as done: {task.get('title')}"
+        return f"I could not find the task '{target}' to mark done."
 
-    if re.match(r"^(set|create)\s+(task|todo)\s+list\s*[:\-]?\s*", text, flags=re.IGNORECASE) or "task list" in lower or "todo list" in lower or lower.startswith("tasks:") or lower.startswith("todo:"):
+    if (re.match(r"^(set|create)\s+(task|todo)\s+list\s*[:\-]?\s*", text, flags=re.IGNORECASE)
+            or "task list" in lower or "todo list" in lower
+            or lower.startswith("tasks:") or lower.startswith("todo:")):
         tasks = set_task_list(text)
         if not tasks:
             return "I did not find any tasks to set."
-        summary = "Task list set:\n" + "\n".join(f"{index + 1}. {task['title']}" for index, task in enumerate(tasks))
-        return summary
+        listing = "\n".join(f"{i + 1}. {t['title']}" for i, t in enumerate(tasks))
+        return "Task list set:\n" + listing
 
     return None
 
@@ -442,203 +340,409 @@ def clear_history():
 
 
 def _extract_user_reply(raw_response):
-    match = re.search(r'<user_reply>(.*?)</user_reply>', raw_response, re.DOTALL)
+    match = re.search(r'<user_reply>(.*?)</user_reply>', raw_response or "", re.DOTALL)
     if match:
         return re.sub(r"\s+", " ", match.group(1)).strip()
     return None
 
 
-def _is_tool_or_memory_turn(raw_response):
-    return bool(re.search(r'<(?:tool|memory)>.*?</(?:tool|memory)>', raw_response, re.DOTALL))
+def build_stable_context():
+    """The part of the prompt frozen for an entire run.
 
+    This is cached block #1. Every model call in a run receives the identical
+    string -- prompt caching is a byte-exact prefix match, so rebuilding it
+    mid-run (after the run has appended to history) would cost every hit.
 
-def _collapse_to_tool_blocks(raw_response):
-    if raw_response is None:
-        return ""
-    blocks = []
-    for kind in ("tool", "memory"):
-        for block in re.findall(rf'<{kind}>(.*?)</{kind}>', raw_response, re.DOTALL):
-            blocks.append(f"<{kind}>{block}</{kind}>")
-    return "\n".join(blocks)
+    Section order is load-bearing: history only grows by appending, so it goes
+    LAST. That keeps each run's block a byte-exact extension of the previous
+    one, which is what lets a later run read the entry an earlier one wrote.
+    Put history first and every new entry shifts what follows, so the prefix
+    diverges and every run pays a fresh cache write.
 
-
-def _route_result_has_failure(route_result):
-    if route_result is None:
-        return False
-    text = str(route_result)
-    if re.search(r"\[(?:PARSER|MEMORY|TOOL) ERROR\]", text, flags=re.IGNORECASE):
-        return True
-    lower = text.lower()
-    return '"error"' in lower or '"deleted": false' in lower or '"reason": "not_found"' in lower
-
-
-def _build_internal_decision_prompt(user_input, history_context, sticky_context, task_context, interface_name="terminal"):
+    Live task state is deliberately NOT in here -- it changes as the loop marks
+    tasks done, so it is re-rendered per step in the volatile part instead.
+    """
     return (
-        "You are in the ALLAN internal decision phase. "
-        "Your job is to decide whether the next step is a tool call, a memory operation, or a direct user-facing answer. "
-        "Do not write a user-facing response yet. Do not narrate your reasoning. "
-        "Choose exactly one action and emit only that action in a single turn.\n\n"
-        "Allowed outputs:\n"
-        "1) <tool>{\"name\": \"...\", ...}</tool>\n"
-        "2) <memory>{\"action\": \"...\", \"args\": {...}}</memory>\n"
-        "3) <user_reply>final answer or brief clarifying question</user_reply>\n\n"
-        "Rules:\n"
-        "- If you need external information, emit <tool> or <memory> only.\n"
-        "- If no external information is needed, emit <user_reply> only.\n"
-        "- Never mix a tool block and a user reply in the same output.\n"
-        "- Never claim a tool or memory action succeeded without fresh execution and verification.\n"
-        "- If the user request is ambiguous, ask for the missing fact in <user_reply> only.\n"
-        "- Respect the active interface formatting rules.\n\n"
-        f"User request: {user_input}\n\n"
-        f"History:\n{history_context}\n\n"
-        f"Sticky notes:\n{sticky_context}\n\n"
-        f"Task context:\n{task_context}\n\n"
-        f"Interface:\n{get_interface_prompt(interface_name)}"
+        LOOP_PROTOCOL + "\n\n"
+        "STANDING CONTEXT (frozen for this run)\n\n"
+        f"Sticky notes:\n{_format_sticky_notes_for_prompt()}\n\n"
+        f"History:\n{_format_history_for_prompt(get_history())}"
     )
 
 
-def _run_internal_decision(user_input, interface_name="terminal"):
-    history = get_history()
-    sticky_context = _format_sticky_notes_for_prompt()
-    task_context = _format_task_prompt_context()
-    history_context = _format_history_for_prompt(history)
-    prompt = _build_internal_decision_prompt(user_input, history_context, sticky_context, task_context, interface_name)
-    thinking, response = call_model(
-        prompt=prompt,
-        model_name=MODEL_NAME,
-        max_tokens=MAX_TOKENS,
-        system_prompt=SYSTEM_PROMPT + "\n" + get_interface_prompt(interface_name),
-    )
-    if thinking:
-        append_to_internal_chat(f"[ALLAN INTERNAL THOUGHT]: {thinking}")
-    if response is None:
-        return ""
-    append_to_internal_chat(f"ALLAN_INTERNAL_DECISION: {response}")
-    return response
+LOOP_PROTOCOL = """ALLAN AGENT LOOP PROTOCOL
+
+You run in a loop. Each step you emit one action, the system executes it, and
+you see the result on the next step. You keep going until the work is genuinely
+finished, then you answer the user once. You are not answering the user on
+every step -- most steps are work.
+
+ACTIONS:
+
+  <task>{"action": "set", "args": {"tasks": ["first", "second"]}}</task>
+  <task>{"action": "done", "args": {"id": "task-1"}}</task>
+  <task>{"action": "add", "args": {"title": "..."}}</task>
+  <task>{"action": "note", "args": {"id": "task-1", "text": "what you found"}}</task>
+  <task>{"action": "fail", "args": {"id": "task-1", "reason": "why it is blocked"}}</task>
+
+  <tool>{"name": "web_search", "args": {"query": "...", "max_results": 3}}</tool>
+  <tool>{"name": "web_dive", "args": {"url": "https://...", "max_chars": 2000}}</tool>
+
+  <memory>{"action": "search", "args": {"query": "...", "scope": "all", "limit": 5}}</memory>
+  <memory>{"action": "write", "args": {"kind": "sticky", "title": "...", "text": "..."}}</memory>
+  <memory>{"action": "write", "args": {"kind": "topical", "page_name": "...", "content": "..."}}</memory>
+
+  <ask_user>a specific question, when you need something only the user knows</ask_user>
+  <user_reply>your single final answer to the user</user_reply>
+
+KNOW WHAT YOU ARE TALKING ABOUT BEFORE YOU ACT:
+
+The user refers to their own projects, people, notes, decisions and shorthand.
+You are not expected to already know these. You ARE expected to find out instead
+of guessing.
+
+- If the request names something specific you have not already seen in this run
+  -- a project, page, person, tool, deadline, or piece of shorthand -- your FIRST
+  action is <memory> search for it. Do not plan around a guess about what it
+  means.
+- If memory does not have it, and you cannot do the work correctly without it,
+  use <ask_user> and ask one specific question. Asking is cheap. Doing three
+  steps of confident work on a wrong assumption is not.
+- Do not infer what the user "probably meant" and proceed. Do not invent a
+  plausible-sounding definition, plan or fact to fill a gap.
+- If you are genuinely unsure whether the request means A or B, and they lead to
+  different work, ask. Do not pick one silently.
+- When you do answer, say what you actually found. If something is uncertain,
+  partial, or came from an assumption, say so in the answer.
+
+HOW TO RUN THE LOOP:
+
+1. If the request needs more than one step, your FIRST action is
+   <task>{"action": "set", ...}</task> laying out the steps. Do not announce the
+   plan to the user -- just set it and start working. If orientation is needed,
+   make "find out what X refers to" the first task.
+2. If the request is a simple direct answer needing no tool, no memory lookup
+   and no multi-step work, emit <user_reply> immediately. Do not invent tasks
+   for trivial requests.
+3. Otherwise work the CURRENT OBJECTIVE shown in the task chain.
+4. When a task is genuinely complete, mark it done and move to the next. Record
+   anything worth keeping with a task note or a memory write before moving on --
+   your step-by-step observations are not permanent.
+5. Only emit <user_reply> when every task is finished or you are truly blocked.
+   <user_reply> ENDS THE RUN. Anything you have not done yet will not get done.
+
+USE YOUR STEPS WELL -- you have a limited number per run:
+
+- Combine the work with its bookkeeping in ONE step. Put the WORK FIRST and the
+  task update after it:
+
+      <memory>{"action": "write", "args": {...}}</memory>
+      <task>{"action": "done", "args": {"id": "task-2"}}</task>
+
+  Order matters. A step stops at its first failure, so if the write fails the
+  task is NOT marked done -- which is correct. Put the task update first and you
+  would be recording success for work that never happened.
+  Spending a whole step on a lone <task>{"action":"done"} is a wasted step.
+- Write ONE JSON object per block, and count your closing braces. A nested
+  "args" object needs two at the end, not three. A malformed block does not run.
+- Emit at most ONE tool or memory call per step -- you need to see its result
+  before deciding the next one. Task updates alongside it are free.
+- Do not create tasks for trivia. Three real tasks beat ten micro-tasks.
+- If you are running low on steps, stop starting new work. Record what you have
+  with a memory write or task note, then answer.
+
+HARD RULES:
+- At most one <tool> or <memory> per step. Never mix any action with
+  <user_reply> or <ask_user> -- those two end the run.
+- Never claim a tool or memory action succeeded. You will see the actual result
+  on the next step; report only what it actually said.
+- If an action fails, read the error and change approach. Do not repeat the same
+  failing call.
+- Memory is <memory>, never <tool> with name "memory". Tasks are <task>, never
+  <tool> with name "task".
+- Put no tool tags, memory tags, task tags or internal reasoning inside
+  <user_reply> or <ask_user>. Those are the only things the user ever sees."""
 
 
-def _generate_user_reply(user_input, context_text, interface_name="terminal"):
-    sticky_context = _format_sticky_notes_for_prompt()
-    prompt = (
-        "You are in the ALLAN user-delivery phase. "
-        "Produce only the final user-facing answer for the user. "
-        "Do not include tool tags, memory tags, raw parser output, or internal reasoning. "
-        "Do not mention that you are thinking or that you are self-prompting. "
-        "Respond in the interface style requested by the user, and keep it concise.\n\n"
-        f"User request: {user_input}\n\n"
-        f"Fresh context:\n{context_text}\n\n"
-        f"Sticky notes:\n{sticky_context}\n\n"
-        f"Interface:\n{get_interface_prompt(interface_name)}"
-    )
-    thinking, response = call_model(
-        prompt=prompt,
-        model_name=MODEL_NAME,
-        max_tokens=MAX_TOKENS,
-        system_prompt=SYSTEM_PROMPT + "\n" + get_interface_prompt(interface_name),
-    )
-    if thinking:
-        append_to_internal_chat(f"[ALLAN INTERNAL THOUGHT]: {thinking}")
-    if response is None:
-        return None
-    append_to_internal_chat(f"ALLAN_USER_RESPONSE_DRAFT: {response}")
-    user_reply = _extract_user_reply(response)
-    if user_reply:
-        return user_reply
-    cleaned = re.sub(r'<(?:tool|memory)>(.*?)</(?:tool|memory)>', '', response, flags=re.DOTALL)
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    if cleaned:
-        return cleaned
+def _extract_ask_user(raw_response):
+    match = re.search(r'<ask_user>(.*?)</ask_user>', raw_response or "", re.DOTALL)
+    if match:
+        return re.sub(r"\s+", " ", match.group(1)).strip()
     return None
 
 
-def _follow_up_after_tool(user_input, tool_result, history_context, interface_name="terminal"):
-    context = (
-        f"The tool finished running and gathered fresh information.\n"
-        f"User request: {user_input}\n\n"
-        f"Tool result:\n{tool_result}\n\n"
-        f"History:\n{history_context}"
+def _build_step_prompt(user_input, step, budget, interface_name):
+    """The volatile per-step suffix. Never cached -- it changes every step."""
+    remaining = budget - step
+    if remaining <= 0:
+        pressure = ("THIS IS YOUR LAST STEP. Do not start anything new. Save anything "
+                    "worth keeping, then answer the user with what you have.")
+    elif remaining <= 2:
+        pressure = (f"ONLY {remaining} STEPS LEFT AFTER THIS ONE. Stop starting new work. "
+                    "Record what you have found, then answer.")
+    elif remaining <= 4:
+        pressure = f"{remaining} steps left after this one. Start converging."
+    else:
+        pressure = f"{remaining} steps left after this one."
+
+    return (
+        f"STEP {step} of {budget}. {pressure}\n\n"
+        f"{format_task_state()}\n\n"
+        f"ORIGINAL USER REQUEST: {user_input}\n\n"
+        f"{get_interface_prompt(interface_name)}\n"
+        "Emit your action now."
     )
-    return _generate_user_reply(user_input, context, interface_name=interface_name)
 
 
-def ALLAN_prime(user_input, interface_name="terminal"):
-    # Temporary feature: Full clear wipe all memory when the user requests it explicitly.
+def _format_observation(step, records):
+    """Render executed actions into an observation block for the next step."""
+    lines = [f"OBSERVATION FROM STEP {step}:"]
+    for record in records:
+        status = "OK" if record["ok"] else "FAILED"
+        result = str(record["result"])
+        if len(result) > 4000:
+            result = result[:4000] + "\n...[truncated]"
+        lines.append(f"[{status}] {record['label']}\n{result}")
+    return "\n".join(lines)
+
+
+def _call_step(prompt, blocks, interface_name):
+    return call_model(
+        prompt=prompt,
+        model_name=MODEL_NAME,
+        max_tokens=MAX_TOKENS,
+        system_prompt=SYSTEM_PROMPT + "\n" + get_interface_prompt(interface_name),
+        cached_context=blocks,
+    )
+
+
+def _force_final_answer(user_input, blocks, interface_name, reason):
+    """Last call of a run that ran out of road. Ask for the answer, nothing else.
+
+    The task chain is deliberately left intact: pending tasks persist to the next
+    turn, so the user can say "continue" and the loop picks up where it stopped
+    rather than starting over.
+    """
+    unfinished = get_pending_tasks()
+    handoff = ""
+    if unfinished:
+        titles = "; ".join(str(t.get("title")) for t in unfinished[:5])
+        handoff = (
+            f"\n{len(unfinished)} task(s) are still unfinished: {titles}\n"
+            "Report what you actually completed, then say plainly what is left. "
+            "Tell the user the task list is saved and they can say 'continue' to "
+            "pick up from here. Do not pretend the job is finished.\n"
+        )
+
+    prompt = (
+        "The work loop has stopped early.\n"
+        f"Reason: {reason}\n"
+        f"{handoff}\n"
+        f"ORIGINAL USER REQUEST: {user_input}\n\n"
+        f"{format_task_state()}\n\n"
+        f"{get_interface_prompt(interface_name)}\n"
+        "Write the final user-facing answer now using only what the steps above "
+        "actually established. Do not claim anything you did not verify. "
+        "Emit only <user_reply>...</user_reply>."
+    )
+    _, response = _call_step(prompt, blocks, interface_name)
+    if not response:
+        return None
+    append_to_internal_chat(f"ALLAN_FORCED_FINAL: {response}")
+
+    reply = _extract_user_reply(response)
+    if reply:
+        return reply
+    # No <user_reply>. Fall back to the bare text only if it is actually prose --
+    # if the model emitted more action blocks, stripping the tags would print raw
+    # JSON at the user. Better to say plainly that the run did not finish.
+    if parse_actions(response):
+        return None
+    cleaned = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", response)).strip()
+    return cleaned or None
+
+
+def ALLAN_prime(user_input, interface_name="terminal", on_progress=None):
+    """Run the agent loop until the work is done, then return one answer.
+
+    Each iteration is one model call that emits one action. Actions are executed
+    and fed back as observations. The run ends when ALLAN emits <user_reply>
+    with no pending tasks, or when a guard trips.
+    """
+    def progress(event_type, **fields):
+        """Emit a structured progress event.
+
+        The engine never formats for humans -- it reports what happened and lets
+        user_interaction_space decide what each interface shows. A terminal wants
+        the mechanical detail; a voice interface must not read task ids aloud.
+        """
+        if on_progress:
+            try:
+                on_progress({"type": event_type, **fields})
+            except Exception:
+                pass  # a broken renderer must not kill a working run
+
     if isinstance(user_input, str) and user_input.strip().lower() == "full clear":
-        # remove raw context and memory dirs
-        try:
-            if os.path.exists(RAW_CONTEXT_DIR):
-                for fname in os.listdir(RAW_CONTEXT_DIR):
-                    try:
-                        os.remove(os.path.join(RAW_CONTEXT_DIR, fname))
-                    except Exception:
-                        pass
-            if os.path.exists(MEMORY_DIR):
-                for fname in os.listdir(MEMORY_DIR):
-                    try:
-                        os.remove(os.path.join(MEMORY_DIR, fname))
-                    except Exception:
-                        pass
-            if os.path.exists(TASKS_FILE):
-                try:
-                    os.remove(TASKS_FILE)
-                except Exception:
-                    pass
-            # rewrite empty history and summary files
-            _write_history(_empty_history())
-            with open(GENERAL_SUMMARY_FILE, "w", encoding="utf-8") as f:
-                json.dump({"summaries": []}, f, ensure_ascii=False, indent=2)
-                f.write("\n")
-        except Exception:
-            pass
-        return "All memory cleared. (raw histories and summaries wiped)"
+        return _full_clear()
 
     append_to_user_chat(f"User: {user_input}")
 
-    decision_response = _run_internal_decision(user_input, interface_name=interface_name)
-    if not decision_response:
-        return "System Error: The LLM API failed to return a decision response."
-
-    if _is_tool_or_memory_turn(decision_response):
-        decision_response = _collapse_to_tool_blocks(decision_response)
-
-    route_result = None
-    tool_was_used = False
-    if re.search(r'<(?:tool|memory)>(.*?)</(?:tool|memory)>', decision_response, re.DOTALL):
-        tool_was_used = True
-        route_result = parse_and_route(decision_response, agent_id="ALLAN_Prime")
-        if route_result:
-            append_to_internal_chat(f"[SYSTEM TOOL EXECUTION]: {route_result}")
-
-    if _route_result_has_failure(route_result):
-        final_user_reply = "The previous tool or memory call failed, so no action was executed."
-        append_to_internal_chat(f"[SYSTEM TOOL EXECUTION FAILURE]: {route_result}")
-        append_to_user_chat(f"ALLAN: {final_user_reply}")
-        return final_user_reply
-
+    # Direct task commands typed by the user are handled without a model call.
     task_command_result = handle_task_command(user_input)
-    if task_command_result is not None and not tool_was_used:
+    if task_command_result is not None:
         append_to_internal_chat(f"[TASK SYSTEM]: {task_command_result}")
-        final_user_reply = task_command_result
-        append_to_user_chat(f"ALLAN: {final_user_reply}")
-        return final_user_reply
+        append_to_user_chat(f"ALLAN: {task_command_result}")
+        return task_command_result
 
-    user_reply = _extract_user_reply(decision_response)
-    if user_reply:
-        final_user_reply = user_reply
-    elif tool_was_used and route_result is not None:
-        follow_up_reply = _follow_up_after_tool(
-            user_input,
-            route_result,
-            _format_history_for_prompt(get_history()),
-            interface_name=interface_name,
+    stable_context = build_stable_context()
+    observations = []          # append-only; each entry becomes its own cached block
+    consecutive_failures = 0
+    nudges = 0
+    final_reply = None
+    stop_reason = None
+
+    step = 0
+    while True:
+        budget = step_budget()
+        if step >= budget:
+            stop_reason = f"the step budget of {budget} was used up"
+            break
+        step += 1
+
+        objective = current_task()
+        progress("step_started", step=step, budget=budget, remaining=budget - step,
+                 objective=objective.get("title") if objective else None)
+
+        blocks = [stable_context] + observations
+        prompt = _build_step_prompt(user_input, step, budget, interface_name)
+
+        thinking, response = _call_step(prompt, blocks, interface_name)
+        if thinking:
+            append_to_internal_chat(f"[ALLAN INTERNAL THOUGHT]: {thinking}")
+        if response is None:
+            stop_reason = "the model API stopped responding"
+            break
+        append_to_internal_chat(f"ALLAN_STEP_{step}: {response}")
+
+        actions = parse_actions(response)
+        reply = _extract_user_reply(response)
+
+        # A question for the user ends the run immediately and is never nudged --
+        # it is not a claim of completion, it is ALLAN admitting it needs input.
+        # Pending tasks stay pending so the answer can resume the chain.
+        question = _extract_ask_user(response)
+        if question and not actions:
+            progress("needs_input", step=step, question=question)
+            append_to_user_chat(f"ALLAN: {question}")
+            return sanitize_reply(question, interface_name)
+
+        # An action always wins over a reply in the same output: do the work
+        # first, deliver later. This is what stops ALLAN answering mid-task.
+        if actions:
+            tasks_before = {t.get("id"): t.get("status") for t in list_tasks()}
+            records = execute_actions(actions, agent_id="ALLAN_Prime")
+            for record in records:
+                progress("action", step=step, kind=record["kind"], label=record["label"],
+                         ok=record["ok"], detail=str(record["result"])[:200])
+                append_to_internal_chat(f"[EXECUTED {record['label']}]: {record['result']}")
+
+            # Report task-state changes as their own events. Interfaces that do
+            # not care about opcodes can still narrate real progress from these.
+            after = list_tasks()
+            if not tasks_before and after:
+                progress("plan_set", count=len(after),
+                         tasks=[t.get("title") for t in after])
+            else:
+                for task in after:
+                    was, now = tasks_before.get(task.get("id")), task.get("status")
+                    if was is not None and was != now and now == "done":
+                        progress("task_done", step=step, id=task.get("id"),
+                                 title=task.get("title"),
+                                 remaining=len(get_pending_tasks()))
+
+            observations.append(_format_observation(step, records))
+
+            if all(not r["ok"] for r in records):
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    stop_reason = (f"{consecutive_failures} steps in a row failed, so the "
+                                   "loop stopped instead of burning more tokens")
+                    break
+            else:
+                consecutive_failures = 0
+            continue
+
+        if reply:
+            # Finishing with work still outstanding is the exact failure mode
+            # this loop exists to prevent -- push back, but only a few times.
+            if has_pending_tasks() and nudges < MAX_EARLY_EXIT_NUDGES:
+                nudges += 1
+                pending = current_task()
+                progress("rejected", step=step, reason="premature_finish",
+                         detail="tried to finish with tasks pending, continuing")
+                observations.append(
+                    f"OBSERVATION FROM STEP {step}:\n"
+                    "[REJECTED] You tried to end the run, but the task chain is not finished. "
+                    f"The current objective is still: {pending.get('id')} -- {pending.get('title')}. "
+                    "Either work it now, or mark it done/failed if it genuinely is. "
+                    "Do not answer the user yet."
+                )
+                continue
+            final_reply = reply
+            stop_reason = "complete"
+            break
+
+        # Neither an action nor a reply: malformed step.
+        consecutive_failures += 1
+        progress("rejected", step=step, reason="invalid_output",
+                 detail="no valid action in output")
+        observations.append(
+            f"OBSERVATION FROM STEP {step}:\n"
+            "[REJECTED] Your output contained no valid action block. Emit <task>, "
+            "<tool> or <memory> with valid JSON inside, or <ask_user> to ask the "
+            "user something, or <user_reply> to finish."
         )
-        final_user_reply = follow_up_reply or "I’ve completed the internal check and am ready to answer."
-    else:
-        final_user_reply = _generate_user_reply(
-            user_input,
-            _format_history_for_prompt(get_history()),
-            interface_name=interface_name,
-        ) or "I’m processing that internally before answering."
+        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            stop_reason = "the model stopped producing valid actions"
+            break
 
-    append_to_user_chat(f"ALLAN: {final_user_reply}")
-    return final_user_reply
+    if final_reply is None:
+        progress("wrapping_up", reason=stop_reason)
+        final_reply = _force_final_answer(
+            user_input, [stable_context] + observations, interface_name, stop_reason
+        )
+    if final_reply is None:
+        final_reply = f"I stopped before finishing: {stop_reason}."
+
+    progress("run_finished", steps=step,
+             outcome="complete" if stop_reason == "complete" else "stopped",
+             reason=None if stop_reason == "complete" else stop_reason)
+
+    append_to_user_chat(f"ALLAN: {final_reply}")
+    return sanitize_reply(final_reply, interface_name)
+
+
+def _full_clear():
+    """Wipe raw context, memory and tasks. Explicit user request only."""
+    try:
+        for directory in (RAW_CONTEXT_DIR, MEMORY_DIR):
+            if os.path.exists(directory):
+                for name in os.listdir(directory):
+                    path = os.path.join(directory, name)
+                    if os.path.isfile(path):
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+        if os.path.exists(TASKS_FILE):
+            try:
+                os.remove(TASKS_FILE)
+            except Exception:
+                pass
+        _write_history(_empty_history())
+        with open(GENERAL_SUMMARY_FILE, "w", encoding="utf-8") as f:
+            json.dump({"summaries": []}, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    except Exception:
+        pass
+    return "All memory cleared. (raw histories and summaries wiped)"
